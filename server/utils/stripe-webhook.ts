@@ -2,11 +2,6 @@ import { H3Event, readRawBody } from "h3";
 import Stripe from "stripe";
 
 const stripeWebhookSecret = requireEnv("STRIPE_WEBHOOK_SECRET");
-const stripeApiKey = requireEnv("STRIPE_API_KEY");
-
-export const stripe = new Stripe(stripeApiKey as string, {
-  apiVersion: "2025-04-30.basil",
-});
 
 /**
  * Verifies that a webhook event was sent by Stripe.
