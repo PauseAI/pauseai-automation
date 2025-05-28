@@ -1,6 +1,5 @@
 import Airtable from "airtable";
 import Stripe from "stripe";
-import { getCheckoutSessionBySubscriptionId } from "./stripe-checkout";
 
 // Define constants for Airtable
 const airtableBaseId = requireEnv("AIRTABLE_BASE_ID");

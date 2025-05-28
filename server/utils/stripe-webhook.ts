@@ -1,6 +1,5 @@
 import { H3Event, readRawBody } from "h3";
 import Stripe from "stripe";
-import { requireEnv } from "./env";
 
 const stripeWebhookSecret = requireEnv("STRIPE_WEBHOOK_SECRET");
 const stripeApiKey = requireEnv("STRIPE_API_KEY");
