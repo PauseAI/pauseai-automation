@@ -1,3 +1,3 @@
-# Nitro starter
+# pauseai-automation
 
-Look at the [nitro quick start](https://nitro.unjs.io/guide#quick-start) to learn more how to get started.
+This repository contains webhook endpoints for updating the payment status of paying members in Airtable.
