@@ -1,6 +1,8 @@
 import Airtable from "airtable";
 import Stripe from "stripe";
 
+const ALPHANUMERIC_REGEX = /^[a-zA-Z0-9]+$/;
+
 // Define constants for Airtable
 const airtableBaseId = requireEnv("AIRTABLE_BASE_ID");
 const airtableTableId = requireEnv("AIRTABLE_TABLE_ID");
@@ -44,6 +46,11 @@ export async function handleSubscriptionEvent(
  */
 async function setPaymentStatus(tallyId: string, status: boolean) {
   try {
+    // Validate Tally ID, Stripe passes on user input
+    if (!ALPHANUMERIC_REGEX.test(tallyId)) {
+      throw new Error("Invalid Tally ID");
+    }
+
     // Find the record with the matching Tally ID
     const records = await table
       .select({
