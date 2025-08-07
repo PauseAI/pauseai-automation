@@ -16,6 +16,7 @@ const table = new Airtable({ apiKey: requireEnv("AIRTABLE_API_KEY") })
 
 interface HandleSubscriptionOptions {
   paymentStatus: boolean;
+  filterByProductId: string;
 }
 
 /**
@@ -27,10 +28,17 @@ interface HandleSubscriptionOptions {
  * @param options.paymentStatus The payment status to set in Airtable.
  */
 export async function handleSubscriptionEvent(
-  stripeEvent: Stripe.CustomerSubscriptionCreatedEvent | Stripe.CustomerSubscriptionDeletedEvent,
+  stripeEvent:
+    | Stripe.CustomerSubscriptionCreatedEvent
+    | Stripe.CustomerSubscriptionDeletedEvent,
   options: HandleSubscriptionOptions
 ) {
   const subscription = stripeEvent.data.object;
+  const subscriptionItems = subscription.items.data;
+  const productIds = subscriptionItems.map(subscriptionItemToProductId);
+  if (!productIds.includes(options.filterByProductId)) {
+    return;
+  }
   const checkoutSession = await getCheckoutSessionBySubscriptionId(
     subscription.id
   );
@@ -80,4 +88,9 @@ async function setPaymentStatus(tallyId: string, status: boolean) {
     );
     throw error; // Re-throw the error for further handling if needed
   }
+}
+
+function subscriptionItemToProductId(item: Stripe.SubscriptionItem): string {
+  const product = item.price.product;
+  return product instanceof Object ? product.id : product;
 }
