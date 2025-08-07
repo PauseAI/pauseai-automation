@@ -1,3 +1,5 @@
+const PRODUCT_ID = requireEnv("STRIPE_PRODUCT_ID");
+
 export default defineEventHandler(async (event) => {
   const stripeEvent = await verifyStripeWebhook(event);
 
@@ -8,10 +10,16 @@ export default defineEventHandler(async (event) => {
 
   switch (stripeEvent.type) {
     case "customer.subscription.created":
-      await handleSubscriptionEvent(stripeEvent, { paymentStatus: true });
+      await handleSubscriptionEvent(stripeEvent, {
+        paymentStatus: true,
+        filterByProductId: PRODUCT_ID,
+      });
       break;
     case "customer.subscription.deleted":
-      await handleSubscriptionEvent(stripeEvent, { paymentStatus: false });
+      await handleSubscriptionEvent(stripeEvent, {
+        paymentStatus: false,
+        filterByProductId: PRODUCT_ID,
+      });
       break;
     default:
       event.node.res.statusCode = 400;
