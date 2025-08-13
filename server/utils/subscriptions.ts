@@ -15,31 +15,40 @@ const table = new Airtable({ apiKey: requireEnv("AIRTABLE_API_KEY") })
   .table(airtableTableId);
 
 interface HandleSubscriptionOptions {
-  productId: string;
+  subscriptionStatus: boolean;
+};
+
+/**
+ * Checks if a Stripe subscription includes a given product.
+ *
+ * @param subscription The Stripe subscription object to check.
+ * @param productId The ID of the product to look for in the subscription items.
+ * @returns true if the subscription includes the product, false otherwise.
+ */
+export async function subscriptionIncludesProduct(subscription: Stripe.Subscription, productId: string) {
+  const subscriptionItems = subscription.items.data;
+  const productIds = subscriptionItems.map(subscriptionItemToProductId);
+  return productIds.includes(productId);
 }
 
 /**
- * Handles a Stripe subscription event by setting the payment status in Airtable based on
- * whether the subscription includes the specified product.
+ * Handles a Stripe subscription event by updating the payment status of the
+ * associated Airtable record.
  *
- * @param subscription The Stripe subscription object.
- * @param options Options for handling the subscription event.
- * @param options.productId The ID of the product to look for in the subscription items.
+ * @param subscription The Stripe subscription object associated with the event.
+ * @param options An object containing the payment status to set in Airtable.
+ * @returns A promise that resolves when the payment status has been updated.
  */
 export async function handleSubscriptionEvent(
   subscription: Stripe.Subscription,
   options: HandleSubscriptionOptions
 ) {
-  const subscriptionItems = subscription.items.data;
-  const productIds = subscriptionItems.map(subscriptionItemToProductId);
-  const subscriptionIncludesProduct = productIds.includes(options.productId);
-
   const checkoutSession = await getCheckoutSessionBySubscriptionId(
     subscription.id
   );
   const tallyId = checkoutSession.client_reference_id;
 
-  await setPaymentStatus(tallyId, subscriptionIncludesProduct);
+  await setPaymentStatus(tallyId, options.subscriptionStatus);
 }
 
 /**

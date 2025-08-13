@@ -11,8 +11,11 @@ export default defineEventHandler(async (event) => {
   switch (stripeEvent.type) {
     case "customer.subscription.created":
     case "customer.subscription.updated":
+      const isPayingMember = await subscriptionIncludesProduct(stripeEvent.data.object, PRODUCT_ID);
+      await handleSubscriptionEvent(stripeEvent.data.object, { subscriptionStatus: isPayingMember });
+      break;
     case "customer.subscription.deleted":
-      await handleSubscriptionEvent(stripeEvent.data.object, { productId: PRODUCT_ID });
+      await handleSubscriptionEvent(stripeEvent.data.object, { subscriptionStatus: false });
       break;
     default:
       event.node.res.statusCode = 400;
