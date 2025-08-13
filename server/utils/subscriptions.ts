@@ -15,35 +15,42 @@ const table = new Airtable({ apiKey: requireEnv("AIRTABLE_API_KEY") })
   .table(airtableTableId);
 
 interface HandleSubscriptionOptions {
-  paymentStatus: boolean;
-  filterByProductId: string;
+  productId: string;
 }
 
 /**
- * Handles a Stripe customer subscription created or deleted event by
- * updating the Airtable payment status associated with the provided Tally ID.
+ * Handles a Stripe subscription event by setting the payment status in Airtable based on
+ * whether the subscription includes the specified product.
  *
- * @param stripeEvent The Stripe event data.
- * @param options Options for handling the event.
- * @param options.paymentStatus The payment status to set in Airtable.
+ * @param subscription The Stripe subscription object.
+ * @param options Options for handling the subscription event.
+ * @param options.productId The ID of the product to look for in the subscription items.
  */
 export async function handleSubscriptionEvent(
-  stripeEvent:
-    | Stripe.CustomerSubscriptionCreatedEvent
-    | Stripe.CustomerSubscriptionDeletedEvent,
+  subscription: Stripe.Subscription,
   options: HandleSubscriptionOptions
 ) {
-  const subscription = stripeEvent.data.object;
   const subscriptionItems = subscription.items.data;
   const productIds = subscriptionItems.map(subscriptionItemToProductId);
-  if (!productIds.includes(options.filterByProductId)) {
-    return;
-  }
+  const subscriptionIncludesProduct = productIds.includes(options.productId);
+
   const checkoutSession = await getCheckoutSessionBySubscriptionId(
     subscription.id
   );
   const tallyId = checkoutSession.client_reference_id;
-  await setPaymentStatus(tallyId, options.paymentStatus);
+
+  await setPaymentStatus(tallyId, subscriptionIncludesProduct);
+}
+
+/**
+ * Extracts the product ID from a Stripe subscription item.
+ *
+ * @param item The subscription item to extract the product ID from.
+ * @returns The product ID as a string.
+ */
+function subscriptionItemToProductId(item: Stripe.SubscriptionItem): string {
+  const product = item.price.product;
+  return product instanceof Object ? product.id : product;
 }
 
 /**
@@ -88,9 +95,4 @@ async function setPaymentStatus(tallyId: string, status: boolean) {
     );
     throw error; // Re-throw the error for further handling if needed
   }
-}
-
-function subscriptionItemToProductId(item: Stripe.SubscriptionItem): string {
-  const product = item.price.product;
-  return product instanceof Object ? product.id : product;
 }

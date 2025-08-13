@@ -10,16 +10,9 @@ export default defineEventHandler(async (event) => {
 
   switch (stripeEvent.type) {
     case "customer.subscription.created":
-      await handleSubscriptionEvent(stripeEvent, {
-        paymentStatus: true,
-        filterByProductId: PRODUCT_ID,
-      });
-      break;
+    case "customer.subscription.updated":
     case "customer.subscription.deleted":
-      await handleSubscriptionEvent(stripeEvent, {
-        paymentStatus: false,
-        filterByProductId: PRODUCT_ID,
-      });
+      await handleSubscriptionEvent(stripeEvent.data.object, { productId: PRODUCT_ID });
       break;
     default:
       event.node.res.statusCode = 400;
