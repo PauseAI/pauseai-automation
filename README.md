@@ -15,4 +15,12 @@ This repository contains API endpoints that support various automations. This in
 
 ## Environment Variables
 
+- `AIRTABLE_API_KEY`: Required for authenticating with the Airtable API.
+- `AIRTABLE_BASE_ID`: Required for connecting to the Airtable base.
+- `AIRTABLE_TABLE_ID`: Required for specifying the Airtable table.
 - `CLUSTERS_API_KEY`: Required for authenticating requests to the `/clusters` endpoint.
+- `PAYMENT_STATUS_FIELD_NAME`: Required for identifying the field name for payment status in Airtable.
+- `STRIPE_API_KEY`: Required for authenticating with the Stripe API.
+- `STRIPE_PRODUCT_ID`: Required for identifying the Stripe product associated with paying members.
+- `STRIPE_WEBHOOK_SECRET`: Required for verifying Stripe webhook events.
+- `TALLY_ID_FIELD_NAME`: Required for identifying the field name for Tally IDs in Airtable.
