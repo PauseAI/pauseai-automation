@@ -1,12 +1,12 @@
 import Airtable from "airtable";
 import Stripe from "stripe";
 
-const ALPHANUMERIC_REGEX = /^[a-zA-Z0-9]+$/;
+// Airtable record IDs look like "recXXXXXXXXXXXXXX" ("rec" + 14 alphanumeric).
+const AIRTABLE_RECORD_ID_REGEX = /^rec[a-zA-Z0-9]{14}$/;
 
 // Define constants for Airtable
 const airtableBaseId = requireEnv("AIRTABLE_BASE_ID");
 const airtableTableId = requireEnv("AIRTABLE_TABLE_ID");
-const tallyIdFieldName = requireEnv("TALLY_ID_FIELD_NAME");
 const paymentStatusFieldName = requireEnv("PAYMENT_STATUS_FIELD_NAME");
 
 // Initialize Airtable
@@ -46,9 +46,9 @@ export async function handleSubscriptionEvent(
   const checkoutSession = await getCheckoutSessionBySubscriptionId(
     subscription.id
   );
-  const tallyId = checkoutSession.client_reference_id;
+  const recordId = checkoutSession.client_reference_id;
 
-  await setPaymentStatus(tallyId, options.subscriptionStatus);
+  await setPaymentStatus(recordId, options.subscriptionStatus);
 }
 
 /**
@@ -63,31 +63,25 @@ function subscriptionItemToProductId(item: Stripe.SubscriptionItem): string {
 }
 
 /**
- * Updates the payment status of an Airtable record associated with the given Tally ID.
+ * Updates the payment status of an Airtable record associated with the given record ID.
  *
- * @param tallyId The Tally ID to look up in Airtable.
+ * The record ID is passed as the Stripe checkout session's `client_reference_id`.
+ * Previously this was a Tally submission ID looked up via a dedicated field; with
+ * the custom onboarding flow it is the Airtable record ID itself, so we can fetch
+ * the record directly.
+ *
+ * @param recordId The Airtable record ID to update.
  * @param status The payment status to set in Airtable.
  */
-async function setPaymentStatus(tallyId: string, status: boolean) {
+async function setPaymentStatus(recordId: string | null, status: boolean) {
   try {
-    // Validate Tally ID, Stripe passes on user input
-    if (!ALPHANUMERIC_REGEX.test(tallyId)) {
-      throw new Error("Invalid Tally ID");
+    // Validate the record ID — Stripe passes on user input
+    if (!recordId || !AIRTABLE_RECORD_ID_REGEX.test(recordId)) {
+      throw new Error("Invalid Airtable record ID");
     }
 
-    // Find the record with the matching Tally ID
-    const records = await table
-      .select({
-        filterByFormula: `{${tallyIdFieldName}} = '${tallyId}'`,
-      })
-      .firstPage();
-
-    if (records.length === 0) {
-      console.warn(`No Airtable record found with Tally ID: ${tallyId}`);
-      return;
-    }
-
-    const record = records[0];
+    // Fetch the record directly by ID
+    const record = await table.find(recordId);
 
     // Update the payment status
     await record.patchUpdate(
@@ -99,7 +93,7 @@ async function setPaymentStatus(tallyId: string, status: boolean) {
     );
   } catch (error) {
     console.error(
-      `Error updating Airtable record for Tally ID ${tallyId}:`,
+      `Error updating Airtable record for record ID ${recordId}:`,
       error
     );
     throw error; // Re-throw the error for further handling if needed
