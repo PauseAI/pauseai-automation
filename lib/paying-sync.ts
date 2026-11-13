@@ -1,17 +1,22 @@
 import type Stripe from "stripe";
-import { includesProduct, isPayingMember, memberIdKind, writeMemberPaying, type PaymentStatusWriters } from "./payment-status";
+import { syncAirtablePaying, DeadlineError, type AirtableClock, type AirtablePayingStore, type AirtableResult } from "./airtable-paying";
+import type { ReconcileResult } from "./crm";
+import { buildPayingSet, memberIdKind, type PayingSet } from "./payment-status";
 
 export interface Page<T> {
   data: T[];
   has_more: boolean;
 }
 
-/** Every item of a Stripe list, page by page. */
+/** Every item of a Stripe list, page by page; rejects once the deadline has passed. */
 export async function* paginate<T extends { id: string }>(
-  fetchPage: (startingAfter: string | undefined) => Promise<Page<T>>
+  fetchPage: (startingAfter: string | undefined) => Promise<Page<T>>,
+  deadline = Infinity,
+  now: () => number = Date.now
 ): AsyncGenerator<T> {
   let startingAfter: string | undefined;
   for (;;) {
+    if (now() >= deadline) throw new DeadlineError("Deadline passed while listing from Stripe");
     const page = await fetchPage(startingAfter);
     yield* page.data;
     if (!page.has_more || page.data.length === 0) return;
@@ -31,101 +36,111 @@ export async function memberIdsBySubscription(sessions: AsyncIterable<SessionRef
   return map;
 }
 
-/** Runs `task` over `items`, at most `limit` at a time, until `stopAt` (ms since epoch). */
-async function forEachLimited<T>(
-  items: T[],
-  limit: number,
-  stopAt: number,
-  task: (item: T) => Promise<void>
-): Promise<number> {
-  let next = 0;
-  const worker = async () => {
-    while (next < items.length && Date.now() < stopAt) await task(items[next++]);
-  };
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-  return items.length - next;
-}
-
 export interface SyncDeps {
   productId: string;
-  subscriptions: AsyncIterable<Stripe.Subscription>;
-  sessions: AsyncIterable<SessionRef>;
-  writers: PaymentStatusWriters;
-  concurrency?: number;
-  /** When to stop starting member writes, in ms since epoch. */
-  stopAt?: number;
+  /** Both list from Stripe and must reject once `deadline` has passed (see paginate). */
+  listSubscriptions: (deadline: number) => AsyncIterable<Stripe.Subscription>;
+  listSessions: (deadline: number) => AsyncIterable<SessionRef>;
+  /** Null when the CRM settings are unset. */
+  reconcile: ((memberIds: string[], options: { dryRun: boolean; deadline: number }) => Promise<ReconcileResult>) | null;
+  airtable: AirtablePayingStore;
+  dryRun: boolean;
+  deadline: number;
+  alert: (message: string) => void;
+  clock?: AirtableClock;
 }
 
 export interface SyncSummary {
-  members: number;
-  written: number;
-  refused: number;
-  skipped: number;
-  failed: number;
-  notReached: number;
-  unmapped: number;
+  dryRun: boolean;
+  discovery: "ok" | "failed";
+  set?: PayingSet;
+  crm: ReconcileResult | "skipped" | "failed";
+  airtable: AirtableResult | "failed";
 }
 
 /**
- * Writes the paying status of every member with a subscription to the
- * product, as Stripe holds it now. A member pays if any of their
- * subscriptions does. One member's failure does not stop the others.
+ * Makes CiviCRM and Airtable hold exactly the members who pay now, as Stripe
+ * says: the whole paying set goes to the CRM in one reconcile, and Airtable
+ * gets the difference to its ticked rows. If listing from Stripe fails or
+ * runs past the deadline, nothing is written.
  */
-export async function syncPayingMembers(deps: SyncDeps): Promise<SyncSummary> {
-  const subscriptions: Stripe.Subscription[] = [];
-  for await (const subscription of deps.subscriptions) {
-    if (includesProduct(subscription, deps.productId)) subscriptions.push(subscription);
+export async function syncPaying(deps: SyncDeps): Promise<SyncSummary> {
+  const tag = deps.dryRun ? "Paying sync (dry run)" : "Paying sync";
+  let set: PayingSet;
+  try {
+    const subscriptions: Stripe.Subscription[] = [];
+    for await (const subscription of deps.listSubscriptions(deps.deadline)) subscriptions.push(subscription);
+    set = buildPayingSet(subscriptions, await memberIdsBySubscription(deps.listSessions(deps.deadline)), deps.productId);
+  } catch (error) {
+    console.error(`${tag}: listing from Stripe failed, nothing written:`, error);
+    deps.alert(`${tag}: listing from Stripe failed or ran past the deadline; nothing written`);
+    return { dryRun: deps.dryRun, discovery: "failed", crm: "skipped", airtable: "failed" };
   }
-  const memberIds = await memberIdsBySubscription(deps.sessions);
+  for (const { subscription, memberId } of set.borrowed) {
+    console.log(`${tag}: subscription ${subscription} takes member id ${memberId} from its customer's other subscription`);
+  }
+  for (const id of set.unmapped) console.warn(`${tag}: subscription ${id} has no member id`);
+  for (const id of set.invalid) console.warn(`${tag}: member id of neither shape: ${JSON.stringify(id).slice(0, 64)}`);
 
-  const byMember = new Map<string, Stripe.Subscription[]>();
-  let unmapped = 0;
-  for (const subscription of subscriptions) {
-    const memberId = memberIds.get(subscription.id);
-    if (!memberId) {
-      unmapped++;
-      console.warn(`Subscription ${subscription.id} has no checkout session with a client_reference_id`);
-      continue;
-    }
-    byMember.set(memberId, [...(byMember.get(memberId) ?? []), subscription]);
+  const paying = [...set.paying];
+  const payingRecordIds = new Set(paying.filter((id) => memberIdKind(id) === "airtable"));
+  if (!deps.reconcile) {
+    const signups = paying.length - payingRecordIds.size;
+    console.warn(`${tag}: CRM settings unset, writing Airtable only; skipped ${signups} signup ids`);
   }
 
-  const summary: SyncSummary = {
-    members: byMember.size,
-    written: 0,
-    refused: 0,
-    skipped: 0,
-    failed: 0,
-    notReached: 0,
-    unmapped,
-  };
-  let skippedSignups = 0;
-  summary.notReached = await forEachLimited(
-    [...byMember],
-    deps.concurrency ?? 4,
-    deps.stopAt ?? Infinity,
-    async ([memberId, memberSubscriptions]) => {
-      if (!memberIdKind(memberId)) {
-        console.error(`Skipping client_reference_id of neither id shape: ${JSON.stringify(memberId).slice(0, 64)}`);
-        summary.skipped++;
-        return;
-      }
-      try {
-        const result = await writeMemberPaying(memberId, isPayingMember(memberSubscriptions, deps.productId), deps.writers);
-        if (result.outcome === "skipped") skippedSignups++;
-        summary[result.outcome]++;
-      } catch {
-        summary.failed++;
-      }
-    }
-  );
-  if (skippedSignups > 0) {
-    console.warn(`CRM settings unset: skipped ${skippedSignups} signup ids`);
-  }
+  const [crm, airtable] = await Promise.all([
+    deps.reconcile
+      ? deps.reconcile(paying, { dryRun: deps.dryRun, deadline: deps.deadline }).catch((error) => {
+          console.error(`${tag}: CiviCRM reconcile failed:`, error);
+          return "failed" as const;
+        })
+      : ("skipped" as const),
+    syncAirtablePaying(payingRecordIds, deps.airtable, {
+      dryRun: deps.dryRun,
+      deadline: deps.deadline,
+      clock: deps.clock,
+    }).catch((error) => {
+      console.error(`${tag}: Airtable sync failed:`, error);
+      return "failed" as const;
+    }),
+  ]);
+
+  const crmLine =
+    typeof crm === "string"
+      ? crm
+      : `${crm.status}${crm.reason ? ` (${crm.reason})` : ""}, ${crm.setTrue} set paying, ${crm.setFalse} cleared, ` +
+        `unresolved ${JSON.stringify(Object.fromEntries(Object.entries(crm.unresolved).map(([k, v]) => [k, v.length])))}`;
+  const airtableLine =
+    typeof airtable === "string"
+      ? airtable
+      : `${airtable.status}, ${airtable.ticked} ticked, ${airtable.toTick.length} to tick, ` +
+        `${airtable.toUntick.length} to untick, ${airtable.written} written, ` +
+        `${airtable.notFound.length} skipped (not found), ${airtable.failed} failed`;
   console.log(
-    `Paying sync: ${summary.members} members, ${summary.written} written, ${summary.refused} refused, ` +
-      `${summary.failed} failed, ${summary.skipped} skipped, ${summary.notReached} not reached, ` +
-      `${summary.unmapped} subscriptions without a member id`
+    `${tag}: ${set.members} members, ${set.paying.size} paying, ${set.borrowed.length} borrowed ids, ` +
+      `${set.unmapped.length} unmapped subscriptions, ${set.unmappedPaying.length} of them paying ` +
+      `${JSON.stringify(set.unmappedPaying)}, ${set.invalid.length} invalid ids. CiviCRM: ${crmLine}. Airtable: ${airtableLine}.`
   );
-  return summary;
+  if (deps.dryRun) {
+    // Everything a person needs to review before the first real run.
+    if (typeof crm === "object") console.log(`${tag}: CiviCRM answer: ${JSON.stringify(crm.answer)}`);
+    if (typeof airtable === "object") {
+      console.log(`${tag}: Airtable ticked now: ${JSON.stringify(airtable.tickedIds)}`);
+      console.log(`${tag}: Airtable would tick ${JSON.stringify(airtable.toTick)}, untick ${JSON.stringify(airtable.toUntick)}`);
+    }
+  }
+  if (typeof airtable === "object" && airtable.notFound.length > 0) {
+    console.warn(`${tag}: Airtable records not found, skipped: ${airtable.notFound.join(", ")}`);
+  }
+
+  const problems = [
+    ...(crm === "failed" ? ["CiviCRM failed"] : []),
+    ...(typeof crm === "object" && crm.status !== "ok" ? [`CiviCRM ${crm.status} (${crm.reason})`] : []),
+    ...(airtable === "failed" ? ["Airtable failed"] : []),
+    ...(typeof airtable === "object" && airtable.status !== "ok" ? [`Airtable ${airtable.status}`] : []),
+    ...(typeof airtable === "object" && airtable.failed > 0 ? [`${airtable.failed} Airtable writes failed`] : []),
+  ];
+  if (problems.length > 0) deps.alert(`${tag}: ${problems.join("; ")}`);
+  return { dryRun: deps.dryRun, discovery: "ok", set, crm, airtable };
 }

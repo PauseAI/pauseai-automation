@@ -1,5 +1,4 @@
 import type Stripe from "stripe";
-import type { CrmAnswer } from "./crm";
 
 // The id the website passes to Stripe as `client_reference_id`: an Airtable
 // record id, or the signup id of a member who signed up in CiviCRM alone.
@@ -25,49 +24,71 @@ export function includesProduct(subscription: Stripe.Subscription, productId: st
   });
 }
 
-/** Whether any of a member's subscriptions makes them a paying member now. */
-export function isPayingMember(subscriptions: Stripe.Subscription[], productId: string): boolean {
-  return subscriptions.some(
-    (subscription) => PAYING_STATUSES.has(subscription.status) && includesProduct(subscription, productId)
-  );
-}
+const customerId = (subscription: Stripe.Subscription) =>
+  typeof subscription.customer === "string" ? subscription.customer : subscription.customer.id;
 
-export interface PaymentStatusWriters {
-  airtable: (recordId: string, paying: boolean) => Promise<void>;
-  /** Null when the CRM settings are unset. */
-  crm: ((memberId: string, paying: boolean) => Promise<CrmAnswer>) | null;
+export interface PayingSet {
+  /** Member ids (both shapes) with at least one paying subscription to the product. */
+  paying: Set<string>;
+  /** Member ids with a subscription to the product, paying or not. */
+  members: number;
+  /** Subscriptions to the product that took their member id from another subscription of the same customer. */
+  borrowed: { subscription: string; memberId: string }[];
+  /** Subscriptions to the product with no member id. */
+  unmapped: string[];
+  /** The unmapped subscriptions that are paying: these members are missed until someone repairs them. */
+  unmappedPaying: string[];
+  /** Member ids of neither shape. */
+  invalid: string[];
 }
-
-export type WriteOutcome = { outcome: "written" } | { outcome: "refused"; reason: string } | { outcome: "skipped" };
 
 /**
- * Writes a member's paying status: to CiviCRM for every id, and to Airtable for
- * Airtable record ids. Without CRM settings a signup id is skipped. Both writes
- * are attempted; if either fails, every failure is logged and this rejects.
- * Both are idempotent.
+ * The member ids that pay now. A subscription's member id is, in order: its
+ * `member_id` metadata (so staff can repair a subscription in Stripe), its
+ * checkout session's `client_reference_id`, or the id of another subscription
+ * of the same Stripe customer. A member pays if any of their subscriptions to
+ * the product is active, trialing or past_due; a member whose subscriptions
+ * all ended or left the product is not in the set.
  */
-export async function writeMemberPaying(
-  memberId: string,
-  paying: boolean,
-  writers: PaymentStatusWriters
-): Promise<WriteOutcome> {
-  const kind = memberIdKind(memberId);
-  if (!kind || (kind === "signup" && !writers.crm)) return { outcome: "skipped" };
-  const [airtable, crm] = await Promise.allSettled([
-    kind === "airtable" ? writers.airtable(memberId, paying) : Promise.resolve(),
-    writers.crm ? writers.crm(memberId, paying) : Promise.resolve(null),
-  ]);
-  const failures = [airtable, crm]
-    .filter((result): result is PromiseRejectedResult => result.status === "rejected")
-    .map((result) => result.reason);
-  for (const failure of failures) {
-    console.error(`Paying status ${paying} for member ${memberId} not recorded:`, failure);
+export function buildPayingSet(
+  subscriptions: Stripe.Subscription[],
+  memberIdBySubscription: Map<string, string>,
+  productId: string
+): PayingSet {
+  const ownId = (subscription: Stripe.Subscription) => {
+    const fromMetadata = subscription.metadata?.member_id;
+    if (fromMetadata && memberIdKind(fromMetadata)) return fromMetadata;
+    return memberIdBySubscription.get(subscription.id);
+  };
+  const memberIdByCustomer = new Map<string, string>();
+  for (const subscription of subscriptions) {
+    const memberId = ownId(subscription);
+    if (memberId && !memberIdByCustomer.has(customerId(subscription))) {
+      memberIdByCustomer.set(customerId(subscription), memberId);
+    }
   }
-  if (failures.length > 0) throw failures[0];
-  const answer = crm.status === "fulfilled" ? crm.value : null;
-  if (answer?.status === "refused") {
-    console.warn(`CiviCRM refused paying status ${paying} for member ${memberId}: ${answer.reason}`);
-    return { outcome: "refused", reason: answer.reason };
+  const set: PayingSet = { paying: new Set(), members: 0, borrowed: [], unmapped: [], unmappedPaying: [], invalid: [] };
+  const members = new Set<string>();
+  for (const subscription of subscriptions) {
+    if (!includesProduct(subscription, productId)) continue;
+    const isPaying = PAYING_STATUSES.has(subscription.status);
+    let memberId = ownId(subscription);
+    if (!memberId) {
+      memberId = memberIdByCustomer.get(customerId(subscription));
+      if (memberId) set.borrowed.push({ subscription: subscription.id, memberId });
+    }
+    if (!memberId) {
+      set.unmapped.push(subscription.id);
+      if (isPaying) set.unmappedPaying.push(subscription.id);
+      continue;
+    }
+    if (!memberIdKind(memberId)) {
+      if (!set.invalid.includes(memberId)) set.invalid.push(memberId);
+      continue;
+    }
+    members.add(memberId);
+    if (isPaying) set.paying.add(memberId);
   }
-  return { outcome: "written" };
+  set.members = members.size;
+  return set;
 }

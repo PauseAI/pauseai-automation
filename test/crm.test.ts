@@ -1,14 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { crmConfigFromEnv, setPayingInCrm } from "../lib/crm";
+import { callCrm, crmConfigFromEnv, reconcilePayingInCrm } from "../lib/crm";
+import { MEM, REC } from "./helpers";
 
 const CONFIG = { url: "https://crm.test", key: "secret-key" };
-const MEM = "mem" + "b".repeat(22);
+const FAR = Date.now() + 3_600_000;
 
-function answer(status: number, body: unknown) {
-  const fetchMock = vi.fn(async () => new Response(JSON.stringify(body), { status }));
+function answers(...rows: unknown[]) {
+  const fetchMock = vi.fn(async () => new Response(JSON.stringify({ values: [rows.shift()] }), { status: 200 }));
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
 }
+
+const ok = (fields: Record<string, unknown>) => ({ status: "ok", set_true: 0, set_false: 0, ...fields });
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -23,45 +26,68 @@ describe("crmConfigFromEnv", () => {
     });
     expect(crmConfigFromEnv({ CRM_URL: "https://crm.test" })).toBeNull();
     expect(crmConfigFromEnv({ CRM_STRIPE_WEBHOOK_KEY: "k" })).toBeNull();
-    expect(crmConfigFromEnv({ CRM_URL: "", CRM_STRIPE_WEBHOOK_KEY: "k" })).toBeNull();
   });
 });
 
-describe("setPayingInCrm", () => {
+describe("callCrm", () => {
   it("posts the API4 call with the key in X-Civi-Auth", async () => {
-    const fetchMock = answer(200, { values: [{ status: "ok", contact_id: 7 }] });
-    await expect(setPayingInCrm(CONFIG, MEM, true)).resolves.toEqual({ status: "ok" });
+    const fetchMock = answers({ status: "ok" });
+    await callCrm(CONFIG, "PauseaiPayingMember/reconcile", { member_ids: [REC], dry_run: true }, 1_000);
     const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
-    expect(url).toBe("https://crm.test/civicrm/ajax/api4/PauseaiPayingMember/set");
+    expect(url).toBe("https://crm.test/civicrm/ajax/api4/PauseaiPayingMember/reconcile");
     expect(init.method).toBe("POST");
     expect((init.headers as Record<string, string>)["X-Civi-Auth"]).toBe("Bearer secret-key");
-    const params = JSON.parse((init.body as URLSearchParams).get("params")!);
-    expect(params).toEqual({ airtable_record_id: MEM, paying: true });
+    expect(JSON.parse((init.body as URLSearchParams).get("params")!)).toEqual({ member_ids: [REC], dry_run: true });
     expect(init.signal).toBeInstanceOf(AbortSignal);
   });
 
-  it.each(["not_found", "erased", "trashed", "not_a_member", "invalid_request"])(
-    "answers a %s refusal with its reason",
-    async (reason) => {
-      answer(200, { values: [{ status: "refused", reason }] });
-      await expect(setPayingInCrm(CONFIG, MEM, false)).resolves.toEqual({ status: "refused", reason });
-    }
-  );
-
   it.each([500, 503, 401])("rejects on HTTP %i", async (status) => {
-    answer(status, { error_message: "x" });
-    await expect(setPayingInCrm(CONFIG, MEM, true)).rejects.toThrow(`HTTP ${status}`);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status })));
+    await expect(callCrm(CONFIG, "X/y", {}, 1_000)).rejects.toThrow(`HTTP ${status}`);
   });
 
   it("rejects on an answer without a status", async () => {
-    answer(200, { values: [] });
-    await expect(setPayingInCrm(CONFIG, MEM, true)).rejects.toThrow(/without a status/);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ values: [] }))));
+    await expect(callCrm(CONFIG, "X/y", {}, 1_000)).rejects.toThrow(/without a status/);
+  });
+});
+
+describe("reconcilePayingInCrm", () => {
+  it("makes one call with the whole set and reads the counts", async () => {
+    const fetchMock = answers(ok({ set_true: 150, set_false: 50, unresolved: { not_found: [MEM] } }));
+    const result = await reconcilePayingInCrm(CONFIG, [REC, MEM], { dryRun: false, deadline: FAR });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const init = (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1];
+    expect(JSON.parse((init.body as URLSearchParams).get("params")!)).toEqual({ member_ids: [REC, MEM], dry_run: false });
+    expect(result).toMatchObject({ status: "ok", setTrue: 150, setFalse: 50, unresolved: { not_found: [MEM] } });
   });
 
-  it("rejects on a network error or timeout", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => {
+  it.each(["too_many_removals", "too_many_changes", "empty_set"])("answers a %s refusal", async (reason) => {
+    answers({ status: "refused", reason, current: 300, target: 10 });
+    const result = await reconcilePayingInCrm(CONFIG, [REC], { dryRun: false, deadline: FAR });
+    expect(result).toMatchObject({ status: "refused", reason, answer: { current: 300 } });
+  });
+
+  it("keeps a dry run's whole answer for the log", async () => {
+    const fetchMock = answers(ok({ dry_run: true, set_true_ids: [{ contact_id: 1, external_identifier: "x" }] }));
+    const result = await reconcilePayingInCrm(CONFIG, [REC], { dryRun: true, deadline: FAR });
+    const init = (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1];
+    expect(JSON.parse((init.body as URLSearchParams).get("params")!)).toMatchObject({ dry_run: true });
+    expect(result.answer).toMatchObject({ set_true_ids: [{ contact_id: 1 }] });
+  });
+
+  it("rejects without calling once the deadline has passed", async () => {
+    const fetchMock = answers(ok({}));
+    await expect(reconcilePayingInCrm(CONFIG, [REC], { dryRun: false, deadline: Date.now() - 1 })).rejects.toThrow(/Deadline/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects on a timeout, without retrying", async () => {
+    const fetchMock = vi.fn(async () => {
       throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
-    }));
-    await expect(setPayingInCrm(CONFIG, MEM, true)).rejects.toThrow(/timeout/);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(reconcilePayingInCrm(CONFIG, [REC], { dryRun: false, deadline: FAR })).rejects.toThrow(/timeout/);
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 });

@@ -1,8 +1,6 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { isPayingMember, memberIdKind, writeMemberPaying } from "../lib/payment-status";
-import { MEM, PRODUCT, REC, subscription, writers } from "./helpers";
-
-afterEach(() => vi.restoreAllMocks());
+import { describe, expect, it } from "vitest";
+import { buildPayingSet, memberIdKind } from "../lib/payment-status";
+import { MEM, MEM2, PRODUCT, REC, REC2, subscription } from "./helpers";
 
 describe("memberIdKind", () => {
   it("tells the two id shapes apart and rejects anything else", () => {
@@ -14,81 +12,91 @@ describe("memberIdKind", () => {
   });
 });
 
-describe("isPayingMember", () => {
-  it("is paying when any subscription is active, so an old canceled one does not override a new one", () => {
-    expect(isPayingMember([subscription("a", "canceled"), subscription("b", "active")], PRODUCT)).toBe(true);
-    expect(isPayingMember([subscription("b", "active"), subscription("a", "canceled")], PRODUCT)).toBe(true);
+describe("buildPayingSet", () => {
+  const build = (subs: ReturnType<typeof subscription>[], map: Record<string, string>) =>
+    buildPayingSet(subs, new Map(Object.entries(map)), PRODUCT);
+
+  it("pays when any subscription is active, so an old canceled one does not override a new one", () => {
+    const set = build([subscription("a", "canceled"), subscription("b", "active")], { a: REC, b: REC });
+    expect([...set.paying]).toEqual([REC]);
+    expect(set.members).toBe(1);
   });
 
-  it("is not paying with only canceled subscriptions", () => {
-    expect(isPayingMember([subscription("a", "canceled"), subscription("b", "canceled")], PRODUCT)).toBe(false);
+  it("does not pay with only canceled subscriptions, so the CRM clears the member", () => {
+    const set = build([subscription("a", "canceled"), subscription("b", "canceled")], { a: REC, b: REC });
+    expect(set.paying.size).toBe(0);
+    expect(set.members).toBe(1);
   });
 
-  it.each(["active", "trialing", "past_due"] as const)("is paying when %s", (status) => {
-    expect(isPayingMember([subscription("a", status)], PRODUCT)).toBe(true);
-    expect(isPayingMember([subscription("a", status, [{ id: PRODUCT }])], PRODUCT)).toBe(true);
+  it.each(["active", "trialing", "past_due"] as const)("pays when %s", (status) => {
+    expect([...build([subscription("a", status, [{ id: PRODUCT }])], { a: MEM }).paying]).toEqual([MEM]);
   });
 
-  it.each(["canceled", "unpaid", "incomplete", "incomplete_expired", "paused"] as const)(
-    "is not paying when %s",
-    (status) => {
-      expect(isPayingMember([subscription("a", status)], PRODUCT)).toBe(false);
-    }
-  );
-
-  it("ignores a subscription without the product", () => {
-    expect(isPayingMember([subscription("a", "active", ["prod_other"])], PRODUCT)).toBe(false);
-  });
-});
-
-describe("writeMemberPaying", () => {
-  it("writes an Airtable record id to Airtable and the CRM", async () => {
-    const w = writers(true);
-    await expect(writeMemberPaying(REC, true, w)).resolves.toEqual({ outcome: "written" });
-    expect(w.airtable).toHaveBeenCalledWith(REC, true);
-    expect(w.crm).toHaveBeenCalledWith(REC, true);
+  it.each(["canceled", "unpaid", "incomplete", "incomplete_expired", "paused"] as const)("does not pay when %s", (status) => {
+    expect(build([subscription("a", status)], { a: MEM }).paying.size).toBe(0);
   });
 
-  it("writes a signup id to the CRM only", async () => {
-    const w = writers(true);
-    await expect(writeMemberPaying(MEM, false, w)).resolves.toEqual({ outcome: "written" });
-    expect(w.airtable).not.toHaveBeenCalled();
-    expect(w.crm).toHaveBeenCalledWith(MEM, false);
+  it("leaves out a subscription that left the product, so the CRM clears the member", () => {
+    const set = build([subscription("a", "active", ["prod_other"])], { a: REC });
+    expect(set.paying.size).toBe(0);
+    expect(set.members).toBe(0);
   });
 
-  it("writes an Airtable record id to Airtable alone without CRM settings", async () => {
-    const w = writers(false);
-    await expect(writeMemberPaying(REC, true, w)).resolves.toEqual({ outcome: "written" });
-    expect(w.airtable).toHaveBeenCalledWith(REC, true);
+  it("borrows the member id from another subscription of the same customer", () => {
+    const set = build(
+      [subscription("old", "canceled", [PRODUCT], "cus_1"), subscription("new", "active", [PRODUCT], "cus_1")],
+      { old: MEM }
+    );
+    expect([...set.paying]).toEqual([MEM]);
+    expect(set.unmapped).toEqual([]);
   });
 
-  it("skips a signup id without CRM settings", async () => {
-    const w = writers(false);
-    await expect(writeMemberPaying(MEM, true, w)).resolves.toEqual({ outcome: "skipped" });
-    expect(w.airtable).not.toHaveBeenCalled();
+  it("borrows from a subscription without the product too", () => {
+    const set = build(
+      [subscription("donation", "active", ["prod_other"], "cus_1"), subscription("member", "active", [PRODUCT], "cus_1")],
+      { donation: REC2 }
+    );
+    expect([...set.paying]).toEqual([REC2]);
   });
 
-  it("answers a CRM refusal with its reason", async () => {
-    vi.spyOn(console, "warn").mockImplementation(() => {});
-    const w = writers(true, { status: "refused", reason: "not_found" });
-    await expect(writeMemberPaying(REC, true, w)).resolves.toEqual({ outcome: "refused", reason: "not_found" });
-    expect(w.airtable).toHaveBeenCalledWith(REC, true);
+  it("counts a subscription with no member id, even through its customer, as unmapped, and lists the paying ones", () => {
+    const set = build(
+      [
+        subscription("a", "active", [PRODUCT], "cus_1"),
+        subscription("b", "active", [PRODUCT], "cus_2"),
+        subscription("c", "canceled", [PRODUCT], "cus_3"),
+      ],
+      { b: MEM2 }
+    );
+    expect(set.unmapped).toEqual(["a", "c"]);
+    expect(set.unmappedPaying).toEqual(["a"]);
+    expect([...set.paying]).toEqual([MEM2]);
   });
 
-  it("logs every failure when both writes fail, and rejects", async () => {
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    const w = writers(true);
-    w.airtable.mockRejectedValueOnce(new Error("airtable down"));
-    w.crm!.mockRejectedValueOnce(new Error("crm down"));
-    await expect(writeMemberPaying(REC, true, w)).rejects.toThrow("airtable down");
-    expect(error.mock.calls.map((call) => (call[1] as Error).message)).toEqual(["airtable down", "crm down"]);
+  it("takes member_id metadata before the session map, so staff can repair a subscription", () => {
+    const repaired = subscription("a", "active");
+    repaired.metadata = { member_id: MEM };
+    const set = build([repaired], { a: REC });
+    expect([...set.paying]).toEqual([MEM]);
   });
 
-  it("still writes the CRM when Airtable fails", async () => {
-    vi.spyOn(console, "error").mockImplementation(() => {});
-    const w = writers(true);
-    w.airtable.mockRejectedValueOnce(new Error("airtable down"));
-    await expect(writeMemberPaying(REC, true, w)).rejects.toThrow("airtable down");
-    expect(w.crm).toHaveBeenCalledWith(REC, true);
+  it("ignores member_id metadata of neither shape", () => {
+    const bad = subscription("a", "active");
+    bad.metadata = { member_id: "junk" };
+    expect([...build([bad], { a: REC }).paying]).toEqual([REC]);
+  });
+
+  it("lends a metadata member id to the customer's other subscriptions and reports the borrow", () => {
+    const repaired = subscription("a", "canceled", [PRODUCT], "cus_1");
+    repaired.metadata = { member_id: MEM };
+    const set = build([repaired, subscription("b", "active", [PRODUCT], "cus_1")], {});
+    expect([...set.paying]).toEqual([MEM]);
+    expect(set.borrowed).toEqual([{ subscription: "b", memberId: MEM }]);
+  });
+
+  it("leaves out ids of neither shape", () => {
+    const set = build([subscription("a", "active")], { a: "junk" });
+    expect(set.invalid).toEqual(["junk"]);
+    expect(set.paying.size).toBe(0);
   });
 });
