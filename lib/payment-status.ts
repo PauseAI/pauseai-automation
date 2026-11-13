@@ -32,12 +32,14 @@ const isTallyId = (id: string | undefined) => memberIdKind(id) === "tally";
  * checkout sessions' ids, before a Tally id is resolved. A record or signup id
  * beats a Tally id, and within each, the metadata beats the sessions, so staff
  * can repair a subscription in Stripe. The metadata's id is final even when it
- * does not resolve. Sessions naming different ids of the same kind conflict.
+ * does not resolve or has no known shape, since staff set it to override the
+ * sessions. Sessions naming different ids of the same kind conflict.
  */
 export function chooseMemberId(
   metadataId: string | undefined,
   sessionIds: string[]
-): { id: string } | { conflict: string[] } | { none: true } {
+): { id: string } | { conflict: string[] } | { invalidMetadata: string } | { none: true } {
+  if (metadataId && !memberIdKind(metadataId)) return { invalidMetadata: metadataId };
   for (const matches of [isRecordOrSignupId, isTallyId]) {
     if (metadataId && matches(metadataId)) return { id: metadataId };
     const fromSessions = [...new Set(sessionIds.filter(matches))];
@@ -64,8 +66,10 @@ export interface PayingSet {
   unmapped: string[];
   /** The unmapped subscriptions that are paying: these payers are missed until someone repairs them. */
   unmappedPaying: string[];
-  /** Checkout session ids of no known shape, on subscriptions that name no other id. */
+  /** Ids of no known shape: `member_id` metadata, and session ids on subscriptions that name no other id. */
   invalid: string[];
+  /** Subscriptions to the product whose `member_id` metadata has no known shape. */
+  invalidMetadata: { subscription: string; id: string }[];
   /** Subscriptions to the product whose checkout sessions name different ids. */
   conflicting: { subscription: string; ids: string[] }[];
   /** Subscriptions to the product named by a Tally id, and how many Airtable rows hold it (1: resolved). */
@@ -88,7 +92,19 @@ export function buildPayingSet(
   productId: string,
   tallyIndex: Map<string, string[]> = new Map()
 ): PayingSet {
-  const set: PayingSet = { paying: new Set(), members: 0, unmapped: [], unmappedPaying: [], invalid: [], conflicting: [], tally: [] };
+  const set: PayingSet = {
+    paying: new Set(),
+    members: 0,
+    unmapped: [],
+    unmappedPaying: [],
+    invalid: [],
+    invalidMetadata: [],
+    conflicting: [],
+    tally: [],
+  };
+  const addInvalid = (id: string) => {
+    if (!set.invalid.includes(id)) set.invalid.push(id);
+  };
   const members = new Set<string>();
   for (const subscription of subscriptions) {
     if (!includesProduct(subscription, productId)) continue;
@@ -96,9 +112,11 @@ export function buildPayingSet(
     const choice = chooseMemberId(subscription.metadata?.member_id, sessionIds);
     let memberId: string | undefined;
     if ("conflict" in choice) set.conflicting.push({ subscription: subscription.id, ids: choice.conflict });
-    else if ("none" in choice) {
-      for (const id of sessionIds) if (!set.invalid.includes(id)) set.invalid.push(id);
-    } else if (isTallyId(choice.id)) {
+    else if ("invalidMetadata" in choice) {
+      set.invalidMetadata.push({ subscription: subscription.id, id: choice.invalidMetadata });
+      addInvalid(choice.invalidMetadata);
+    } else if ("none" in choice) sessionIds.forEach(addInvalid);
+    else if (isTallyId(choice.id)) {
       const rows = tallyIndex.get(choice.id) ?? [];
       set.tally.push({ subscription: subscription.id, tallyId: choice.id, rows: rows.length });
       if (rows.length === 1) memberId = rows[0];

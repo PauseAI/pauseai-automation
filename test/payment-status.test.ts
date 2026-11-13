@@ -30,12 +30,18 @@ describe("chooseMemberId", () => {
     expect(chooseMemberId(undefined, [REC, MEM])).toEqual({ conflict: [REC, MEM] });
     expect(chooseMemberId(undefined, [TALLY, TALLY2])).toEqual({ conflict: [TALLY, TALLY2] });
     expect(chooseMemberId(undefined, [REC, REC])).toEqual({ id: REC });
+    expect(chooseMemberId(TALLY, [REC, REC2])).toEqual({ conflict: [REC, REC2] });
   });
 
-  it("ignores ids of no known shape", () => {
-    expect(chooseMemberId("junk-id", [REC, "junk-id"])).toEqual({ id: REC });
-    expect(chooseMemberId("junk-id", ["other-junk"])).toEqual({ none: true });
+  it("ignores session ids of no known shape", () => {
+    expect(chooseMemberId(undefined, [REC, "junk-id"])).toEqual({ id: REC });
+    expect(chooseMemberId(undefined, ["junk-id"])).toEqual({ none: true });
     expect(chooseMemberId(undefined, [])).toEqual({ none: true });
+    expect(chooseMemberId("", [REC])).toEqual({ id: REC });
+  });
+
+  it("keeps metadata of no known shape as final, without falling back to the sessions", () => {
+    expect(chooseMemberId("junk-id", [REC])).toEqual({ invalidMetadata: "junk-id" });
   });
 });
 
@@ -98,10 +104,14 @@ describe("buildPayingSet", () => {
     expect([...build([repaired], { a: REC }).paying]).toEqual([MEM]);
   });
 
-  it("ignores member_id metadata of no known shape", () => {
+  it("leaves a subscription with member_id metadata of no known shape unmapped and reports it", () => {
     const bad = subscription("a", "active");
     bad.metadata = { member_id: "junk-id" };
-    expect([...build([bad], { a: REC }).paying]).toEqual([REC]);
+    const set = build([bad], { a: REC });
+    expect(set.paying.size).toBe(0);
+    expect(set.unmappedPaying).toEqual(["a"]);
+    expect(set.invalid).toEqual(["junk-id"]);
+    expect(set.invalidMetadata).toEqual([{ subscription: "a", id: "junk-id" }]);
   });
 
   it("leaves out session ids of no known shape and reports them", () => {

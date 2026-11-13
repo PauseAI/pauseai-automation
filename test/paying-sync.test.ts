@@ -263,6 +263,7 @@ describe("syncPaying", () => {
       expect(airtable.setPaying.mock.calls).toEqual([[REC, true]]);
       expect(logged("warn")).toContain("Paying sync: subscription sub_t2 has no member id");
       expect(logged("warn")).toContain(`Paying sync: subscription sub_lost: Tally id ${TALLY2} not found`);
+      expect(logged("warn")).not.toContain("Paying sync: subscription sub_lost has no member id");
       expect(
         logged("log").some((line) => /1 resolved via Tally id, 1 Tally ids not found, 0 Tally ids on several rows/.test(line))
       ).toBe(true);
@@ -295,14 +296,51 @@ describe("syncPaying", () => {
       expect(logged("warn")).toContain(`Paying sync: subscription sub_t: Tally id ${TALLY} on 2 rows`);
     });
 
-    it("writes nothing when the only chosen Tally id is a metadata one that matches no row, even if a session's would", async () => {
+    it("keeps a metadata Tally id that matches no row, does not mark the session's person paying, and writes", async () => {
       const repaired = subscription("sub_m", "active");
       repaired.metadata = { member_id: TALLY };
-      const built = tallyDeps(
+      const { d, reconcile, alert } = tallyDeps(
         { tally: [{ id: REC, tallyId: TALLY2 }] },
         { listSubscriptions: () => from([repaired]), listSessions: () => from([session("cs_m", "sub_m", TALLY2)]) }
       );
-      expectNothingWritten(built, await syncPaying(built.d), /reading Tally IDs from Airtable failed/);
+      await syncPaying(d);
+      expect(reconcile.mock.calls[0][0]).toEqual([]);
+      expect(reconcile.mock.calls[0][1]).toMatchObject({ unmappedPaying: 1 });
+      expect(alert.mock.calls[0][0]).toMatch(/1 paying subscriptions without a member id/);
+    });
+
+    const legacy = (count: number, status: "active" | "canceled" = "active") => ({
+      listSubscriptions: () => from(Array.from({ length: count }, (_, i) => subscription(`sub_${i}`, status))),
+      listSessions: () => from(Array.from({ length: count }, (_, i) => session(`cs_${i}`, `sub_${i}`, `Tally${i}x`))),
+    });
+
+    it("writes with one or two unmatched Tally ids when the index has rows, counting them unmapped", async () => {
+      const { d, reconcile } = tallyDeps({ tally: [{ id: REC, tallyId: TALLY }] }, legacy(2));
+      const summary = await syncPaying(d);
+      expect(summary.discovery).toBe("ok");
+      expect(reconcile.mock.calls[0][1]).toMatchObject({ unmappedPaying: 2 });
+    });
+
+    it("writes nothing when three or more Tally ids match no row", async () => {
+      const built = tallyDeps({ tally: [{ id: REC, tallyId: TALLY }] }, legacy(3));
+      expectNothingWritten(built, await syncPaying(built.d), /none of 3 Tally ids matches an Airtable row; nothing written/);
+    });
+
+    it("writes when one of several Tally ids matches a row", async () => {
+      const { d, reconcile } = tallyDeps({ tally: [{ id: REC, tallyId: "Tally0x" }] }, legacy(4));
+      await syncPaying(d);
+      expect(reconcile.mock.calls[0][0]).toEqual([REC]);
+      expect(reconcile.mock.calls[0][1]).toMatchObject({ unmappedPaying: 3 });
+    });
+
+    it("does not count canceled legacy subscriptions that resolve as a misread", async () => {
+      const { d, reconcile } = tallyDeps(
+        { tally: ["Tally0x", "Tally1x", "Tally2x"].map((tallyId, i) => ({ id: "rec" + String(i).repeat(14), tallyId })) },
+        legacy(3, "canceled")
+      );
+      const summary = await syncPaying(d);
+      expect(summary.discovery).toBe("ok");
+      expect(reconcile.mock.calls[0][0]).toEqual([]);
     });
 
     it("logs a subscription whose sessions name different ids", async () => {
@@ -313,7 +351,18 @@ describe("syncPaying", () => {
       await syncPaying(d);
       expect(reconcile.mock.calls[0][1]).toMatchObject({ unmappedPaying: 1 });
       expect(logged("warn")).toContain(`Paying sync: subscription sub_1: checkout sessions name different ids ["${REC}","${REC2}"]`);
+      expect(logged("warn")).not.toContain("Paying sync: subscription sub_1 has no member id");
       expect(logged("log").some((line) => /0 paying, 1 with conflicting ids/.test(line))).toBe(true);
+    });
+
+    it("warns once about member_id metadata of no known shape, truncated, and leaves the subscription unmapped", async () => {
+      const bad = subscription("sub_1", "active");
+      bad.metadata = { member_id: "x".repeat(100) };
+      const { d, reconcile } = deps({ listSubscriptions: () => from([bad]), listSessions: () => from([session("cs_1", "sub_1", REC)]) });
+      await syncPaying(d);
+      expect(reconcile.mock.calls[0][0]).toEqual([]);
+      const warnings = logged("warn").filter((line) => line.includes("sub_1") || line.includes("xxx"));
+      expect(warnings).toEqual([`Paying sync: subscription sub_1: member_id metadata of no known shape: "${"x".repeat(63)}`]);
     });
 
     it("reads the Tally IDs on every run", async () => {
@@ -322,14 +371,14 @@ describe("syncPaying", () => {
       expect(airtable.listPage.mock.calls[0][0]).toBe("tally");
     });
 
-    it("writes nothing when no Tally id matches a row", async () => {
+    it("writes nothing when the Tally index is empty", async () => {
       const built = tallyDeps({ tally: [] });
-      expectNothingWritten(built, await syncPaying(built.d), /reading Tally IDs from Airtable failed/);
+      expectNothingWritten(built, await syncPaying(built.d), /Tally index empty, though 2 subscriptions carry Tally ids; nothing written/);
     });
 
     it("writes nothing when the Tally ID field returns values that are not text", async () => {
       const built = tallyDeps({ tally: [{ id: REC, tallyId: [TALLY] }] });
-      expectNothingWritten(built, await syncPaying(built.d), /reading Tally IDs from Airtable failed/);
+      expectNothingWritten(built, await syncPaying(built.d), /Tally index empty/);
     });
 
     it("writes nothing when reading the Tally IDs fails", async () => {
