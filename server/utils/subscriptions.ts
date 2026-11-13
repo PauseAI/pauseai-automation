@@ -1,9 +1,6 @@
 import Airtable from "airtable";
 import Stripe from "stripe";
 
-// Airtable record IDs look like "recXXXXXXXXXXXXXX" ("rec" + 14 alphanumeric).
-const AIRTABLE_RECORD_ID_REGEX = /^rec[a-zA-Z0-9]{14}$/;
-
 // Define constants for Airtable
 const airtableBaseId = requireEnv("AIRTABLE_BASE_ID");
 const airtableTableId = requireEnv("AIRTABLE_TABLE_ID");
@@ -13,6 +10,11 @@ const paymentStatusFieldName = requireEnv("PAYMENT_STATUS_FIELD_NAME");
 const table = new Airtable({ apiKey: requireEnv("AIRTABLE_API_KEY") })
   .base(airtableBaseId)
   .table(airtableTableId);
+
+const crmConfig = crmConfigFromEnv();
+if (!crmConfig) {
+  console.warn("CRM_URL or CRM_STRIPE_WEBHOOK_KEY is unset: payment status goes to Airtable only");
+}
 
 interface HandleSubscriptionOptions {
   subscriptionStatus: boolean;
@@ -33,10 +35,10 @@ export async function subscriptionIncludesProduct(subscription: Stripe.Subscript
 
 /**
  * Handles a Stripe subscription event by updating the payment status of the
- * associated Airtable record.
+ * associated member in Airtable and CiviCRM.
  *
  * @param subscription The Stripe subscription object associated with the event.
- * @param options An object containing the payment status to set in Airtable.
+ * @param options An object containing the payment status to set.
  * @returns A promise that resolves when the payment status has been updated.
  */
 export async function handleSubscriptionEvent(
@@ -46,9 +48,10 @@ export async function handleSubscriptionEvent(
   const checkoutSession = await getCheckoutSessionBySubscriptionId(
     subscription.id
   );
-  const recordId = checkoutSession.client_reference_id;
-
-  await setPaymentStatus(recordId, options.subscriptionStatus);
+  await writePaymentStatus(checkoutSession.client_reference_id, options.subscriptionStatus, {
+    airtable: setAirtablePaymentStatus,
+    crm: crmConfig ? (memberId, status) => setPayingInCrm(crmConfig, memberId, status) : null,
+  });
 }
 
 /**
@@ -63,27 +66,15 @@ function subscriptionItemToProductId(item: Stripe.SubscriptionItem): string {
 }
 
 /**
- * Updates the payment status of an Airtable record associated with the given record ID.
- *
- * The record ID is passed as the Stripe checkout session's `client_reference_id`.
- * Previously this was a Tally submission ID looked up via a dedicated field; with
- * the custom onboarding flow it is the Airtable record ID itself, so we can fetch
- * the record directly.
+ * Updates the payment status of the Airtable record with the given ID.
  *
  * @param recordId The Airtable record ID to update.
  * @param status The payment status to set in Airtable.
  */
-async function setPaymentStatus(recordId: string | null, status: boolean) {
+async function setAirtablePaymentStatus(recordId: string, status: boolean) {
   try {
-    // Validate the record ID — Stripe passes on user input
-    if (!recordId || !AIRTABLE_RECORD_ID_REGEX.test(recordId)) {
-      throw new Error("Invalid Airtable record ID");
-    }
-
-    // Fetch the record directly by ID
     const record = await table.find(recordId);
 
-    // Update the payment status
     await record.patchUpdate(
       Object.fromEntries([[paymentStatusFieldName, status]])
     );
@@ -96,6 +87,6 @@ async function setPaymentStatus(recordId: string | null, status: boolean) {
       `Error updating Airtable record for record ID ${recordId}:`,
       error
     );
-    throw error; // Re-throw the error for further handling if needed
+    throw error;
   }
 }
