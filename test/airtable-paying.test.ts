@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { removalOverrideActive, syncAirtablePaying, type AirtablePayingStore, type AirtableRow } from "../lib/airtable-paying";
+import {
+  pacedAirtableRequests,
+  readTallyIndex,
+  removalOverrideActive,
+  syncAirtablePaying,
+  type AirtablePayingStore,
+  type AirtableRow,
+} from "../lib/airtable-paying";
 import { fakeClock } from "./helpers";
 
 const rec = (n: number) => "rec" + String(n).padStart(14, "0");
@@ -225,5 +232,29 @@ describe("removalOverrideActive", () => {
     expect(removalOverrideActive("2026-11-13T11:59:59Z", now)).toBe(false);
     expect(removalOverrideActive("not a time", now)).toBe(false);
     expect(removalOverrideActive(undefined, now)).toBe(false);
+  });
+});
+
+describe("readTallyIndex", () => {
+  it("maps each trimmed Tally id to every row holding it, across pages, paced", async () => {
+    const clock = fakeClock();
+    const pages: Record<string, { records: AirtableRow[]; offset?: string }> = {
+      start: { records: [{ id: rec(1), tallyId: " KYle2vK\n" }, { id: rec(2), tallyId: "A7v1k6e" }], offset: "p2" },
+      p2: { records: [{ id: rec(3), tallyId: "KYle2vK" }, { id: rec(4), tallyId: "  " }, { id: rec(5) }] },
+    };
+    const s: AirtablePayingStore = {
+      listPage: vi.fn(async (kind, offset) => {
+        expect(kind).toBe("tally");
+        clock.starts.push(clock.now());
+        return pages[offset ?? "start"];
+      }),
+      setPaying: vi.fn(),
+    };
+    const index = await readTallyIndex(s, pacedAirtableRequests(Infinity, clock));
+    expect([...index]).toEqual([
+      ["KYle2vK", [rec(1), rec(3)]],
+      ["A7v1k6e", [rec(2)]],
+    ]);
+    expect(clock.starts[1] - clock.starts[0]).toBeGreaterThanOrEqual(200);
   });
 });

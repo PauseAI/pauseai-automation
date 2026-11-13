@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { buildPayingSet, memberIdKind } from "../lib/payment-status";
-import { MEM, MEM2, PRODUCT, REC, REC2, subscription } from "./helpers";
+import { MEM, MEM2, PRODUCT, REC, REC2, TALLY, TALLY2, subscription } from "./helpers";
 
 describe("memberIdKind", () => {
-  it("tells the two id shapes apart and rejects anything else", () => {
+  it("tells the three id shapes apart and rejects anything else", () => {
     expect(memberIdKind(REC)).toBe("airtable");
     expect(memberIdKind(MEM)).toBe("signup");
-    for (const id of [null, "", REC + "x", MEM.slice(0, -1), "rec-AAAAAAAAAAAAA", "cus_123"]) {
+    for (const id of [TALLY, "81x7BbP", "abc123", "abcd1234"]) expect(memberIdKind(id)).toBe("tally");
+    for (const id of [null, "", REC + "x", MEM.slice(0, -1), "rec-AAAAAAAAAAAAA", "cus_123", "abc12", "abcd12345", "KYle-vK", " KYle2vK"]) {
       expect(memberIdKind(id)).toBeNull();
     }
   });
@@ -146,3 +147,57 @@ describe("buildPayingSet", () => {
   });
 });
 
+describe("buildPayingSet with Tally ids", () => {
+  const build = (subs: ReturnType<typeof subscription>[], map: Record<string, string>, index: Record<string, string[]>) =>
+    buildPayingSet(subs, new Map(Object.entries(map)), PRODUCT, new Map(Object.entries(index)));
+
+  it("resolves a Tally id on exactly one row to that row's record id", () => {
+    const set = build([subscription("a", "active")], { a: TALLY }, { [TALLY]: [REC] });
+    expect([...set.paying]).toEqual([REC]);
+    expect(set.viaTally).toEqual([{ subscription: "a", tallyId: TALLY, memberId: REC }]);
+    expect(set.unmapped).toEqual([]);
+    expect(set.invalid).toEqual([]);
+  });
+
+  it("leaves a Tally id on no row unmapped and reports it", () => {
+    const set = build([subscription("a", "active")], { a: TALLY }, { [TALLY2]: [REC] });
+    expect(set.paying.size).toBe(0);
+    expect(set.tallyNotFound).toEqual([{ subscription: "a", tallyId: TALLY }]);
+    expect(set.unmappedPaying).toEqual(["a"]);
+    expect(set.invalid).toEqual([]);
+  });
+
+  it("leaves a Tally id on several rows unmapped and reports how many", () => {
+    const set = build([subscription("a", "active")], { a: TALLY }, { [TALLY]: [REC, REC2] });
+    expect(set.paying.size).toBe(0);
+    expect(set.tallyAmbiguous).toEqual([{ subscription: "a", tallyId: TALLY, rows: 2 }]);
+    expect(set.unmappedPaying).toEqual(["a"]);
+  });
+
+  it("lends a resolved Tally id to the customer's other subscriptions", () => {
+    const set = build(
+      [subscription("old", "canceled", [PRODUCT], "cus_1"), subscription("new", "active", [PRODUCT], "cus_1")],
+      { old: TALLY },
+      { [TALLY]: [REC] }
+    );
+    expect([...set.paying]).toEqual([REC]);
+    expect(set.borrowed).toEqual([{ subscription: "new", memberId: REC }]);
+  });
+
+  it("does not lend an unresolved Tally id", () => {
+    const set = build(
+      [subscription("old", "canceled", [PRODUCT], "cus_1"), subscription("new", "active", [PRODUCT], "cus_1")],
+      { old: TALLY },
+      {}
+    );
+    expect(set.borrowed).toEqual([]);
+    expect(set.unmappedPaying).toEqual(["new"]);
+  });
+
+  it("still counts a junk id as invalid", () => {
+    const set = build([subscription("a", "active")], { a: "KYle-vK" }, { "KYle-vK": [REC] });
+    expect(set.invalid).toEqual(["KYle-vK"]);
+    expect(set.paying.size).toBe(0);
+    expect(set.viaTally).toEqual([]);
+  });
+});

@@ -22,15 +22,19 @@ export interface AirtableRow {
   id: string;
   /** The `Merged into` link: set on a row merged away into another. */
   mergedInto?: string[];
+  /** The Tally submission id the row was created from, as stored. */
+  tallyId?: string;
 }
+
+export type AirtableRows = "ticked" | "links" | "tally";
 
 export interface AirtablePayingStore {
   /**
-   * One page of the ticked rows, or of every row with its `Merged into` link.
-   * The links are read unfiltered: a formula on a link field sees the linked
-   * rows' primary field text, which can be blank.
+   * One page of the ticked rows, of every row with its `Merged into` link, or
+   * of the rows with a Tally ID. The links are read unfiltered: a formula on a
+   * link field sees the linked rows' primary field text, which can be blank.
    */
-  listPage: (rows: "ticked" | "links", offset: string | undefined) => Promise<{ records: AirtableRow[]; offset?: string }>;
+  listPage: (rows: AirtableRows, offset: string | undefined) => Promise<{ records: AirtableRow[]; offset?: string }>;
   /** Sets one row's payment status; `not_found` when the row does not exist. */
   setPaying: (recordId: string, paying: boolean) => Promise<"ok" | "not_found">;
 }
@@ -72,6 +76,56 @@ export function removalOverrideActive(until: string | undefined, now: number): b
   return Number.isFinite(expiry) && expiry > now && expiry - now <= MAX_OVERRIDE_AHEAD_MS;
 }
 
+/** Runs one Airtable request at a time. */
+export type AirtableRequest = <T>(call: () => Promise<T>) => Promise<T>;
+
+/**
+ * Runs Airtable requests at the base's rate limit, retrying a rate limit or
+ * server error a little, and never past the deadline. Every request of a run
+ * goes through one of these, so the pacing holds across reads and writes.
+ */
+export function pacedAirtableRequests(deadline: number, clock: AirtableClock = realClock): AirtableRequest {
+  let nextStart = 0;
+  return async (call) => {
+    for (let attempt = 1; ; attempt++) {
+      const wait = Math.max(0, nextStart - clock.now());
+      if (clock.now() + wait >= deadline) throw new DeadlineError("Deadline passed during the Airtable sync");
+      if (wait > 0) await clock.sleep(wait);
+      nextStart = clock.now() + MIN_INTERVAL_MS;
+      try {
+        return await call();
+      } catch (error) {
+        const code = statusCode(error);
+        // The client reports a timeout or connection error with a null status.
+        const retryable = code == null || code === 429 || code >= 500;
+        if (!retryable || attempt >= MAX_ATTEMPTS) throw error;
+        nextStart = clock.now() + (code === 429 ? RATE_LIMIT_WAIT_MS : 1_000 * attempt);
+      }
+    }
+  };
+}
+
+async function listAll(store: AirtablePayingStore, request: AirtableRequest, rows: AirtableRows) {
+  const records: AirtableRow[] = [];
+  let offset: string | undefined;
+  do {
+    const page = await request(() => store.listPage(rows, offset));
+    records.push(...page.records);
+    offset = page.offset;
+  } while (offset);
+  return records;
+}
+
+/** Each Tally id, trimmed, to the record ids of every row that holds it. */
+export async function readTallyIndex(store: AirtablePayingStore, request: AirtableRequest): Promise<Map<string, string[]>> {
+  const index = new Map<string, string[]>();
+  for (const row of await listAll(store, request, "tally")) {
+    const tallyId = typeof row.tallyId === "string" ? row.tallyId.trim() : "";
+    if (tallyId) index.set(tallyId, [...(index.get(tallyId) ?? []), row.id]);
+  }
+  return index;
+}
+
 /**
  * Brings Airtable's payment status in line with the paying record ids. It
  * reads the ticked rows and every row's merge link once, page by page, then
@@ -86,40 +140,12 @@ export function removalOverrideActive(until: string | undefined, now: number): b
 export async function syncAirtablePaying(
   payingRecordIds: Set<string>,
   store: AirtablePayingStore,
-  options: { dryRun: boolean; deadline: number; allowRemovals?: boolean; clock?: AirtableClock }
+  options: { dryRun: boolean; deadline: number; allowRemovals?: boolean; clock?: AirtableClock; request?: AirtableRequest }
 ): Promise<AirtableResult> {
-  const clock = options.clock ?? realClock;
-  let nextStart = 0;
-  const request = async <T>(call: () => Promise<T>): Promise<T> => {
-    for (let attempt = 1; ; attempt++) {
-      const wait = Math.max(0, nextStart - clock.now());
-      if (clock.now() + wait >= options.deadline) throw new DeadlineError("Deadline passed during the Airtable sync");
-      if (wait > 0) await clock.sleep(wait);
-      nextStart = clock.now() + MIN_INTERVAL_MS;
-      try {
-        return await call();
-      } catch (error) {
-        const code = statusCode(error);
-        // The client reports a timeout or connection error with a null status.
-        const retryable = code == null || code === 429 || code >= 500;
-        if (!retryable || attempt >= MAX_ATTEMPTS) throw error;
-        nextStart = clock.now() + (code === 429 ? RATE_LIMIT_WAIT_MS : 1_000 * attempt);
-      }
-    }
-  };
-  const listAll = async (rows: "ticked" | "links") => {
-    const records: AirtableRow[] = [];
-    let offset: string | undefined;
-    do {
-      const page = await request(() => store.listPage(rows, offset));
-      records.push(...page.records);
-      offset = page.offset;
-    } while (offset);
-    return records;
-  };
+  const request = options.request ?? pacedAirtableRequests(options.deadline, options.clock);
 
   const mergedInto = new Map<string, string[]>();
-  for (const row of await listAll("links")) {
+  for (const row of await listAll(store, request, "links")) {
     if (Array.isArray(row.mergedInto) && row.mergedInto.length > 0) mergedInto.set(row.id, row.mergedInto);
   }
   // The surviving row a merged-away row leads to, or null when its path forks,
@@ -147,7 +173,7 @@ export async function syncAirtablePaying(
     }
   }
 
-  const ticked = (await listAll("ticked")).map((row) => row.id).filter((id) => !mergedInto.has(id));
+  const ticked = (await listAll(store, request, "ticked")).map((row) => row.id).filter((id) => !mergedInto.has(id));
   const tickedSet = new Set(ticked);
   const result: AirtableResult = {
     status: "ok",

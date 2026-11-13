@@ -1,5 +1,13 @@
 import type Stripe from "stripe";
-import { syncAirtablePaying, DeadlineError, type AirtableClock, type AirtablePayingStore, type AirtableResult } from "./airtable-paying";
+import {
+  pacedAirtableRequests,
+  readTallyIndex,
+  syncAirtablePaying,
+  DeadlineError,
+  type AirtableClock,
+  type AirtablePayingStore,
+  type AirtableResult,
+} from "./airtable-paying";
 import { hasUnresolved, type ReconcileOptions, type ReconcileResult } from "./crm";
 import { buildPayingSet, memberIdKind, type PayingSet } from "./payment-status";
 
@@ -69,26 +77,51 @@ export interface SyncSummary {
 /**
  * Makes CiviCRM and Airtable hold exactly the members who pay now, as Stripe
  * says: the whole paying set goes to the CRM in one reconcile, and Airtable
- * gets the difference to its ticked rows. If listing from Stripe fails or
- * runs past the deadline, nothing is written.
+ * gets the difference to its ticked rows. Tally ids are resolved to Airtable
+ * record ids first, since the CRM knows members by record id. If listing from
+ * Stripe or reading the Tally IDs fails or runs past the deadline, nothing is
+ * written.
  */
 export async function syncPaying(deps: SyncDeps): Promise<SyncSummary> {
   const tag = deps.dryRun ? "Paying sync (dry run)" : "Paying sync";
-  let set: PayingSet;
-  try {
-    const subscriptions: Stripe.Subscription[] = [];
-    for await (const subscription of deps.listSubscriptions(deps.deadline)) subscriptions.push(subscription);
-    set = buildPayingSet(subscriptions, await memberIdsBySubscription(deps.listSessions(deps.deadline)), deps.productId);
-  } catch (error) {
-    console.error(`${tag}: listing from Stripe failed, nothing written:`, error);
-    deps.alert(`${tag}: listing from Stripe failed or ran past the deadline; nothing written`);
+  const failed = (message: string, error: unknown): SyncSummary => {
+    console.error(`${tag}: ${message}, nothing written:`, error);
+    deps.alert(`${tag}: ${message} or ran past the deadline; nothing written`);
     return { dryRun: deps.dryRun, discovery: "failed", crm: "skipped", airtable: "failed" };
+  };
+  const subscriptions: Stripe.Subscription[] = [];
+  let sessionIds: Map<string, string>;
+  try {
+    for await (const subscription of deps.listSubscriptions(deps.deadline)) subscriptions.push(subscription);
+    sessionIds = await memberIdsBySubscription(deps.listSessions(deps.deadline));
+  } catch (error) {
+    return failed("listing from Stripe failed", error);
   }
+  // One pacer for every Airtable request of the run, reads and writes.
+  const airtableRequest = pacedAirtableRequests(deps.deadline, deps.clock);
+  const hasTallyIds =
+    subscriptions.some((subscription) => memberIdKind(subscription.metadata?.member_id) === "tally") ||
+    [...sessionIds.values()].some((id) => memberIdKind(id) === "tally");
+  let tallyIndex = new Map<string, string[]>();
+  if (hasTallyIds) {
+    try {
+      tallyIndex = await readTallyIndex(deps.airtable, airtableRequest);
+    } catch (error) {
+      return failed("reading Tally IDs from Airtable failed", error);
+    }
+  }
+  const set = buildPayingSet(subscriptions, sessionIds, deps.productId, tallyIndex);
   for (const { subscription, memberId } of set.borrowed) {
     console.log(`${tag}: subscription ${subscription} takes member id ${memberId} from its customer's other subscription`);
   }
+  for (const { subscription, tallyId } of set.tallyNotFound) {
+    console.warn(`${tag}: subscription ${subscription}: Tally id ${tallyId} not found`);
+  }
+  for (const { subscription, tallyId, rows } of set.tallyAmbiguous) {
+    console.warn(`${tag}: subscription ${subscription}: Tally id ${tallyId} on ${rows} rows`);
+  }
   for (const id of set.unmapped) console.warn(`${tag}: subscription ${id} has no member id`);
-  for (const id of set.invalid) console.warn(`${tag}: member id of neither shape: ${JSON.stringify(id).slice(0, 64)}`);
+  for (const id of set.invalid) console.warn(`${tag}: member id of no known shape: ${JSON.stringify(id).slice(0, 64)}`);
 
   const paying = [...set.paying];
   const payingRecordIds = new Set(paying.filter((id) => memberIdKind(id) === "airtable"));
@@ -112,7 +145,7 @@ export async function syncPaying(deps: SyncDeps): Promise<SyncSummary> {
       dryRun: deps.dryRun,
       deadline: deps.deadline,
       allowRemovals: deps.allowAirtableRemovals,
-      clock: deps.clock,
+      request: airtableRequest,
     }).catch((error) => {
       console.error(`${tag}: Airtable sync failed:`, error);
       return "failed" as const;
@@ -134,6 +167,8 @@ export async function syncPaying(deps: SyncDeps): Promise<SyncSummary> {
         `${airtable.notFound.length} skipped (not found), ${airtable.failed} failed`;
   console.log(
     `${tag}: ${set.members} members, ${set.paying.size} paying, ${set.borrowed.length} borrowed ids, ` +
+      `${set.viaTally.length} resolved via Tally id, ${set.tallyNotFound.length} Tally ids not found, ` +
+      `${set.tallyAmbiguous.length} Tally ids on several rows, ` +
       `${set.unmapped.length} unmapped subscriptions, ${set.unmappedPaying.length} of them paying ` +
       `${JSON.stringify(set.unmappedPaying)}, ${set.invalid.length} invalid ids. CiviCRM: ${crmLine}. Airtable: ${airtableLine}.`
   );

@@ -6,6 +6,8 @@ export const REC2 = "rec" + "B".repeat(14);
 export const MEM = "mem" + "b".repeat(22);
 export const MEM2 = "mem" + "c".repeat(22);
 export const PRODUCT = "prod_member";
+export const TALLY = "KYle2vK";
+export const TALLY2 = "A7v1k6e";
 
 export function subscription(
   id: string,
