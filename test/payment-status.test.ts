@@ -1,28 +1,6 @@
-import type Stripe from "stripe";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  isPayingSubscription,
-  memberIdKind,
-  recordSubscriptionStatus,
-  writePaymentStatus,
-} from "../server/utils/payment-status";
-
-const REC = "rec" + "A".repeat(14);
-const MEM = "mem" + "b".repeat(22);
-const PRODUCT = "prod_member";
-
-const writers = (crm: boolean) => ({
-  airtable: vi.fn(async (_id: string, _status: boolean) => {}),
-  crm: crm ? vi.fn(async (_id: string, _status: boolean) => {}) : null,
-});
-
-function subscription(status: Stripe.Subscription.Status, products: (string | { id: string })[]) {
-  return {
-    id: "sub_1",
-    status,
-    items: { data: products.map((product) => ({ price: { product } })) },
-  } as unknown as Stripe.Subscription;
-}
+import { isPayingMember, memberIdKind, writeMemberPaying } from "../lib/payment-status";
+import { MEM, PRODUCT, REC, subscription, writers } from "./helpers";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -36,112 +14,81 @@ describe("memberIdKind", () => {
   });
 });
 
-describe("isPayingSubscription", () => {
-  it.each(["active", "trialing", "past_due"] as const)("is paying when %s with the product", (status) => {
-    expect(isPayingSubscription(subscription(status, ["prod_other", PRODUCT]), PRODUCT)).toBe(true);
-    expect(isPayingSubscription(subscription(status, [{ id: PRODUCT }]), PRODUCT)).toBe(true);
+describe("isPayingMember", () => {
+  it("is paying when any subscription is active, so an old canceled one does not override a new one", () => {
+    expect(isPayingMember([subscription("a", "canceled"), subscription("b", "active")], PRODUCT)).toBe(true);
+    expect(isPayingMember([subscription("b", "active"), subscription("a", "canceled")], PRODUCT)).toBe(true);
   });
 
-  it.each(["active", "trialing", "past_due"] as const)("is not paying when %s without the product", (status) => {
-    expect(isPayingSubscription(subscription(status, ["prod_other"]), PRODUCT)).toBe(false);
+  it("is not paying with only canceled subscriptions", () => {
+    expect(isPayingMember([subscription("a", "canceled"), subscription("b", "canceled")], PRODUCT)).toBe(false);
+  });
+
+  it.each(["active", "trialing", "past_due"] as const)("is paying when %s", (status) => {
+    expect(isPayingMember([subscription("a", status)], PRODUCT)).toBe(true);
+    expect(isPayingMember([subscription("a", status, [{ id: PRODUCT }])], PRODUCT)).toBe(true);
   });
 
   it.each(["canceled", "unpaid", "incomplete", "incomplete_expired", "paused"] as const)(
-    "is not paying when %s, even with the product",
+    "is not paying when %s",
     (status) => {
-      expect(isPayingSubscription(subscription(status, [PRODUCT]), PRODUCT)).toBe(false);
+      expect(isPayingMember([subscription("a", status)], PRODUCT)).toBe(false);
     }
   );
-});
 
-describe("recordSubscriptionStatus", () => {
-  it("writes the live status, not the event's: an old update of a since canceled subscription writes false", async () => {
-    const w = writers(true);
-    const retrieveSubscription = vi.fn(async () => subscription("canceled", [PRODUCT]));
-    await recordSubscriptionStatus("sub_1", {
-      productId: PRODUCT,
-      retrieveSubscription,
-      clientReferenceId: async () => REC,
-      writers: w,
-    });
-    expect(retrieveSubscription).toHaveBeenCalledWith("sub_1");
-    expect(w.airtable).toHaveBeenCalledWith(REC, false);
-    expect(w.crm).toHaveBeenCalledWith(REC, false);
-  });
-
-  it("writes true for a live active subscription with the product", async () => {
-    const w = writers(true);
-    await recordSubscriptionStatus("sub_1", {
-      productId: PRODUCT,
-      retrieveSubscription: async () => subscription("active", [PRODUCT]),
-      clientReferenceId: async () => MEM,
-      writers: w,
-    });
-    expect(w.crm).toHaveBeenCalledWith(MEM, true);
-    expect(w.airtable).not.toHaveBeenCalled();
+  it("ignores a subscription without the product", () => {
+    expect(isPayingMember([subscription("a", "active", ["prod_other"])], PRODUCT)).toBe(false);
   });
 });
 
-describe("writePaymentStatus", () => {
+describe("writeMemberPaying", () => {
   it("writes an Airtable record id to Airtable and the CRM", async () => {
     const w = writers(true);
-    await writePaymentStatus(REC, true, w);
+    await expect(writeMemberPaying(REC, true, w)).resolves.toEqual({ outcome: "written" });
     expect(w.airtable).toHaveBeenCalledWith(REC, true);
     expect(w.crm).toHaveBeenCalledWith(REC, true);
   });
 
   it("writes a signup id to the CRM only", async () => {
     const w = writers(true);
-    await writePaymentStatus(MEM, false, w);
+    await expect(writeMemberPaying(MEM, false, w)).resolves.toEqual({ outcome: "written" });
     expect(w.airtable).not.toHaveBeenCalled();
     expect(w.crm).toHaveBeenCalledWith(MEM, false);
   });
 
   it("writes an Airtable record id to Airtable alone without CRM settings", async () => {
     const w = writers(false);
-    await writePaymentStatus(REC, true, w);
+    await expect(writeMemberPaying(REC, true, w)).resolves.toEqual({ outcome: "written" });
     expect(w.airtable).toHaveBeenCalledWith(REC, true);
   });
 
-  it("rejects a signup id without CRM settings, so Stripe retries", async () => {
+  it("skips a signup id without CRM settings", async () => {
     const w = writers(false);
-    await expect(writePaymentStatus(MEM, true, w)).rejects.toThrow(/No CRM settings/);
+    await expect(writeMemberPaying(MEM, true, w)).resolves.toEqual({ outcome: "skipped" });
     expect(w.airtable).not.toHaveBeenCalled();
   });
 
-  it("logs and resolves for an id of neither shape", async () => {
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    const w = writers(true);
-    await writePaymentStatus("not-an-id", true, w);
-    await writePaymentStatus(null, true, w);
-    expect(w.airtable).not.toHaveBeenCalled();
-    expect(w.crm).not.toHaveBeenCalled();
-    expect(error).toHaveBeenCalledTimes(2);
-  });
-
-  it("still writes the CRM when Airtable fails, then rejects", async () => {
-    vi.spyOn(console, "error").mockImplementation(() => {});
-    const w = writers(true);
-    w.airtable.mockRejectedValueOnce(new Error("airtable down"));
-    await expect(writePaymentStatus(REC, true, w)).rejects.toThrow("airtable down");
-    expect(w.crm).toHaveBeenCalledWith(REC, true);
-  });
-
-  it("still writes Airtable when the CRM fails, then rejects", async () => {
-    vi.spyOn(console, "error").mockImplementation(() => {});
-    const w = writers(true);
-    w.crm!.mockRejectedValueOnce(new Error("crm down"));
-    await expect(writePaymentStatus(REC, true, w)).rejects.toThrow("crm down");
+  it("answers a CRM refusal with its reason", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const w = writers(true, { status: "refused", reason: "not_found" });
+    await expect(writeMemberPaying(REC, true, w)).resolves.toEqual({ outcome: "refused", reason: "not_found" });
     expect(w.airtable).toHaveBeenCalledWith(REC, true);
   });
 
-  it("logs every failure when both writes fail", async () => {
+  it("logs every failure when both writes fail, and rejects", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     const w = writers(true);
     w.airtable.mockRejectedValueOnce(new Error("airtable down"));
     w.crm!.mockRejectedValueOnce(new Error("crm down"));
-    await expect(writePaymentStatus(REC, true, w)).rejects.toThrow("airtable down");
-    const logged = error.mock.calls.map((call) => (call[1] as Error).message);
-    expect(logged).toEqual(["airtable down", "crm down"]);
+    await expect(writeMemberPaying(REC, true, w)).rejects.toThrow("airtable down");
+    expect(error.mock.calls.map((call) => (call[1] as Error).message)).toEqual(["airtable down", "crm down"]);
+  });
+
+  it("still writes the CRM when Airtable fails", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const w = writers(true);
+    w.airtable.mockRejectedValueOnce(new Error("airtable down"));
+    await expect(writeMemberPaying(REC, true, w)).rejects.toThrow("airtable down");
+    expect(w.crm).toHaveBeenCalledWith(REC, true);
   });
 });

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { crmConfigFromEnv, setPayingInCrm } from "../server/utils/crm";
+import { crmConfigFromEnv, setPayingInCrm } from "../lib/crm";
 
 const CONFIG = { url: "https://crm.test", key: "secret-key" };
 const MEM = "mem" + "b".repeat(22);
@@ -29,9 +29,8 @@ describe("crmConfigFromEnv", () => {
 
 describe("setPayingInCrm", () => {
   it("posts the API4 call with the key in X-Civi-Auth", async () => {
-    vi.spyOn(console, "log").mockImplementation(() => {});
     const fetchMock = answer(200, { values: [{ status: "ok", contact_id: 7 }] });
-    await setPayingInCrm(CONFIG, MEM, true);
+    await expect(setPayingInCrm(CONFIG, MEM, true)).resolves.toEqual({ status: "ok" });
     const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe("https://crm.test/civicrm/ajax/api4/PauseaiPayingMember/set");
     expect(init.method).toBe("POST");
@@ -41,20 +40,13 @@ describe("setPayingInCrm", () => {
     expect(init.signal).toBeInstanceOf(AbortSignal);
   });
 
-  it.each(["erased", "trashed", "not_a_member", "invalid_request"])(
-    "logs a %s refusal and resolves",
+  it.each(["not_found", "erased", "trashed", "not_a_member", "invalid_request"])(
+    "answers a %s refusal with its reason",
     async (reason) => {
-      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
       answer(200, { values: [{ status: "refused", reason }] });
-      await expect(setPayingInCrm(CONFIG, MEM, false)).resolves.toBeUndefined();
-      expect(warn.mock.calls[0][0]).toContain(reason);
+      await expect(setPayingInCrm(CONFIG, MEM, false)).resolves.toEqual({ status: "refused", reason });
     }
   );
-
-  it("rejects a not_found refusal, so Stripe retries until the signup lands", async () => {
-    answer(200, { values: [{ status: "refused", reason: "not_found" }] });
-    await expect(setPayingInCrm(CONFIG, MEM, true)).rejects.toThrow(/no member/);
-  });
 
   it.each([500, 503, 401])("rejects on HTTP %i", async (status) => {
     answer(status, { error_message: "x" });

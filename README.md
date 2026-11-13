@@ -2,27 +2,29 @@
 
 [![Netlify Status](https://api.netlify.com/api/v1/badges/290ed007-d791-4047-b486-ad6a3f7e818d/deploy-status)](https://app.netlify.com/projects/pauseai-automation/deploys)
 
-This repository contains webhook endpoints for updating the payment status of paying members in Airtable.
+This repository keeps the paying status of PauseAI members in step with Stripe, in CiviCRM and (for members who still have one) in Airtable.
 
 ## How it works
 
-When a member completes a Stripe checkout, Stripe sends subscription webhook events to this service. The webhook reads the `client_reference_id` from the Stripe checkout session — this is the **Airtable record ID** of the member (set by the onboarding flow when a volunteer opts in to becoming a paying member). The webhook then fetches that Airtable record directly by ID and updates its payment status field.
+Once a day at 15:00 UTC, the scheduled function `netlify/functions/paying-sync.mts` starts the background function `netlify/functions/paying-sync-background.mts`, which may run for up to 15 minutes. Netlify gives scheduled functions only 30 seconds, and Nitro's scheduled tasks have no Netlify support, so the work runs in the background function and the scheduled one only starts it, with a token derived from `STRIPE_API_KEY` so no one else can.
 
-> **Note:** Previously, `client_reference_id` was a Tally submission ID, and the webhook looked up the Airtable record by matching a dedicated field. With the migration to the custom onboarding flow, `client_reference_id` is now the Airtable record ID itself, so the lookup is a direct `find()` instead of a filtered search. The `TALLY_ID_FIELD_NAME` env var is no longer required.
+The sync (`lib/paying-sync.ts`):
 
-## CiviCRM
+1. Lists every Stripe subscription (all statuses) and keeps those that include `STRIPE_PRODUCT_ID`.
+2. Lists completed checkout sessions once, to map each subscription to the session's `client_reference_id`: the member's id, set by the onboarding flow.
+3. Groups the subscriptions by member. A member pays if any of their subscriptions is `active`, `trialing` or `past_due`, so an old canceled subscription does not override a new one.
+4. Writes each member, four at a time (`writeMemberPaying` in `lib/payment-status.ts`): to CiviCRM through the CRM's `PauseaiPayingMember.set` API4 action, called with the API key of its `stripe-webhook` API account, for every id; and to Airtable's payment status field for Airtable record ids (`rec` + 14 characters). A signup id (`mem` + 22 characters) belongs to a member who signed up in CiviCRM alone and goes to CiviCRM only.
+5. Logs a summary line: members seen, written, refused, failed, skipped, not reached, and subscriptions without a member id.
 
-PauseAI's CRM (CiviCRM) is taking over member data, so the webhook also records the payment status there, through the CRM's `PauseaiPayingMember.set` API4 action, called with the API key of the CRM's `stripe-webhook` API account. `client_reference_id` is either an Airtable record ID (`rec` + 14 characters), which goes to both Airtable and CiviCRM, or a signup ID (`mem` + 22 characters) for a member who signed up in CiviCRM alone, which goes to CiviCRM only.
+A member id of neither shape is logged and skipped. A CiviCRM refusal (`not_found`, `erased`, `trashed`, `not_a_member`, `invalid_request`) is logged and counted. A failed write is logged and counted and does not stop the run; the next day's run tries again. The run stops starting writes after 12 minutes, so it can still log its summary.
 
-Set `CRM_URL` and `CRM_STRIPE_WEBHOOK_KEY` to turn this on. While either is unset, the webhook writes Airtable record IDs to Airtable only, and an event for a signup ID fails (so Stripe retries it) rather than being written to Airtable.
+While `CRM_URL` or `CRM_STRIPE_WEBHOOK_KEY` is unset, the sync writes Airtable record ids to Airtable only and skips signup ids, with one log line.
 
-For every event the webhook reads the subscription from Stripe as it is now: the member pays while it is `active`, `trialing` or `past_due` and includes `STRIPE_PRODUCT_ID`. So an event that arrives late, out of order or as a retry still records the current status.
-
-A `client_reference_id` of neither shape and a CiviCRM refusal other than `not_found` (`erased`, `trashed`, `not_a_member`, `invalid_request`) are logged and answered with 200, since a retry cannot fix them. Anything else fails the webhook so that Stripe retries the event: CiviCRM's `not_found` (a member can pay before their signup reaches the CRM), a failed Airtable write (a missing record included), a Stripe, Airtable or CiviCRM network error, timeout or HTTP error. Both writes are idempotent, so a retry repeats the one that succeeded harmlessly. Every call is time-bounded so the function answers well within Netlify's function time limit.
+The Stripe webhook route `server/routes/stripe.post.ts` only acknowledges events, until the endpoint is removed from Stripe. A real-time path would call `writeMemberPaying`.
 
 Accepted limits:
 
-- Two events for the same member handled at the same time can leave a stale value until the next event for that subscription.
 - Only the first page of a subscription's items is checked for `STRIPE_PRODUCT_ID`.
+- A change in Stripe reaches the stores by the next day's run.
 
 Run the unit tests with `pnpm test`.

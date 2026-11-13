@@ -1,21 +1,10 @@
+import { defineEventHandler, readBody } from "h3";
+
+// The daily paying sync (netlify/functions/paying-sync*) owns paying status, so
+// this only acknowledges Stripe's events until the endpoint is removed from
+// Stripe; a real-time path would call writeMemberPaying from lib/payment-status.
 export default defineEventHandler(async (event) => {
-  const stripeEvent = await verifyStripeWebhook(event);
-
-  if (!stripeEvent) {
-    event.node.res.statusCode = 400;
-    return { status: "error", message: "Webhook verification failed" };
-  }
-
-  switch (stripeEvent.type) {
-    case "customer.subscription.created":
-    case "customer.subscription.updated":
-    case "customer.subscription.deleted":
-      await handleSubscriptionEvent(stripeEvent.data.object.id);
-      break;
-    default:
-      event.node.res.statusCode = 400;
-      return { status: "error", message: "Unexpected Stripe event type" };
-  }
-
+  const body = await readBody(event).catch(() => null);
+  console.log(`Stripe event ignored: ${String(body?.type).slice(0, 64)} ${String(body?.data?.object?.id).slice(0, 64)}`);
   return { status: "success" };
 });

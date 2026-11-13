@@ -8,6 +8,8 @@ export interface CrmConfig {
   key: string;
 }
 
+export type CrmAnswer = { status: "ok" } | { status: "refused"; reason: string };
+
 /** The CRM settings, or null when either is unset. */
 export function crmConfigFromEnv(env: NodeJS.ProcessEnv = process.env): CrmConfig | null {
   const url = env.CRM_URL?.replace(/\/+$/, "");
@@ -16,17 +18,15 @@ export function crmConfigFromEnv(env: NodeJS.ProcessEnv = process.env): CrmConfi
 }
 
 /**
- * Records in CiviCRM whether the member with this id pays. A refusal is logged
- * and resolves, since a retry gets the same answer, except `not_found`: a
- * member can pay before their signup reaches the CRM, so that rejects, as do a
- * network error, a timeout, an HTTP error and an answer without a status, and
- * Stripe retries.
+ * Records in CiviCRM whether the member with this id pays, and answers `ok` or
+ * the refusal reason. A network error, a timeout, an HTTP error or an answer
+ * without a status rejects.
  */
 export async function setPayingInCrm(
   config: CrmConfig,
   memberId: string,
   paying: boolean
-): Promise<void> {
+): Promise<CrmAnswer> {
   const response = await fetch(config.url + SET_PAYING_PATH, {
     method: "POST",
     headers: {
@@ -44,17 +44,8 @@ export async function setPayingInCrm(
     throw new Error(`CiviCRM answered HTTP ${response.status} for member ${memberId}`);
   }
   const body = (await response.json()) as { values?: unknown[] } | null;
-  const row = body?.values?.[0] as { status?: unknown; reason?: unknown; contact_id?: unknown } | undefined;
-  if (row?.status === "ok") {
-    console.log(`CiviCRM contact ${row.contact_id} (member ${memberId}) updated with payment status: ${paying}`);
-    return;
-  }
-  if (row?.status === "refused" && row.reason === "not_found") {
-    throw new Error(`CiviCRM has no member ${memberId} yet`);
-  }
-  if (row?.status === "refused") {
-    console.warn(`CiviCRM refused payment status ${paying} for member ${memberId}: ${row.reason}`);
-    return;
-  }
+  const row = body?.values?.[0] as { status?: unknown; reason?: unknown } | undefined;
+  if (row?.status === "ok") return { status: "ok" };
+  if (row?.status === "refused") return { status: "refused", reason: String(row.reason) };
   throw new Error(`CiviCRM answered without a status for member ${memberId}`);
 }
