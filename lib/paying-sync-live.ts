@@ -1,9 +1,14 @@
 import Airtable from "airtable";
 import Stripe from "stripe";
+import { removalOverrideActive } from "./airtable-paying";
 import { alert } from "./alert";
 import { crmConfigFromEnv, reconcilePayingInCrm } from "./crm";
 import { requireEnv } from "./env";
 import { paginate, syncPaying, type SyncSummary } from "./paying-sync";
+
+// The link pauseai-civicrm's scripts/import/merge-members.py sets on a row
+// merged away into another; the CRM's import skips such rows too.
+const MERGED_INTO_FIELD = "Merged into";
 
 // Netlify stops a background function after 15 minutes. The whole run, Stripe
 // listing included, stays within this, so it can always log its summary.
@@ -19,13 +24,13 @@ export async function runPayingSync(): Promise<SyncSummary> {
   });
   // The sync paces and retries Airtable requests itself; the client's own
   // rate-limit retry can wait for minutes.
-  const table = new Airtable({
+  const base = new Airtable({
     apiKey: requireEnv("AIRTABLE_API_KEY"),
     requestTimeout: 10_000,
     noRetryIfRateLimited: true,
-  })
-    .base(requireEnv("AIRTABLE_BASE_ID"))
-    .table(requireEnv("AIRTABLE_TABLE_ID"));
+  }).base(requireEnv("AIRTABLE_BASE_ID"));
+  const tableId = requireEnv("AIRTABLE_TABLE_ID");
+  const table = base(tableId);
   const field = requireEnv("PAYMENT_STATUS_FIELD_NAME");
   const crm = crmConfigFromEnv();
 
@@ -40,14 +45,20 @@ export async function runPayingSync(): Promise<SyncSummary> {
       ),
     reconcile: crm ? (memberIds, options) => reconcilePayingInCrm(crm, memberIds, options) : null,
     airtable: {
-      // Pages are paced like every other Airtable request.
-      listTicked: async () => {
-        const ids: string[] = [];
-        await table.select({ filterByFormula: `{${field}}`, fields: [field], pageSize: 100 }).eachPage((records, next) => {
-          ids.push(...records.map((record) => record.id));
-          setTimeout(next, 200);
+      listPage: async (rows, offset) => {
+        const shown = rows === "ticked" ? field : MERGED_INTO_FIELD;
+        const response = await base.makeRequest({
+          path: `/${encodeURIComponent(tableId)}`,
+          qs: { filterByFormula: `{${shown}}`, fields: [shown], pageSize: 100, ...(offset ? { offset } : {}) },
         });
-        return ids;
+        const body = response.body as { records: { id: string; fields: Record<string, unknown> }[]; offset?: string };
+        return {
+          records: body.records.map((record) => ({
+            id: record.id,
+            mergedInto: record.fields[MERGED_INTO_FIELD] as string[] | undefined,
+          })),
+          offset: body.offset,
+        };
       },
       setPaying: async (recordId, paying) => {
         try {
@@ -60,6 +71,7 @@ export async function runPayingSync(): Promise<SyncSummary> {
         }
       },
     },
+    allowAirtableRemovals: removalOverrideActive(process.env.PAYING_SYNC_AIRTABLE_ALLOW_REMOVALS_UNTIL, Date.now()),
     dryRun: process.env.PAYING_SYNC_DRY_RUN === "1",
     deadline,
     alert,

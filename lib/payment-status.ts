@@ -34,9 +34,9 @@ export interface PayingSet {
   members: number;
   /** Subscriptions to the product that took their member id from another subscription of the same customer. */
   borrowed: { subscription: string; memberId: string }[];
-  /** Subscriptions to the product with no member id. */
+  /** Subscriptions to the product with no valid member id. */
   unmapped: string[];
-  /** The unmapped subscriptions that are paying: these members are missed until someone repairs them. */
+  /** The unmapped subscriptions that are paying: these payers are missed until someone repairs them. */
   unmappedPaying: string[];
   /** Member ids of neither shape. */
   invalid: string[];
@@ -45,10 +45,10 @@ export interface PayingSet {
 /**
  * The member ids that pay now. A subscription's member id is, in order: its
  * `member_id` metadata (so staff can repair a subscription in Stripe), its
- * checkout session's `client_reference_id`, or the id of another subscription
- * of the same Stripe customer. A member pays if any of their subscriptions to
- * the product is active, trialing or past_due; a member whose subscriptions
- * all ended or left the product is not in the set.
+ * checkout session's `client_reference_id`, or, when the customer's other
+ * subscriptions name exactly one valid member id, that one. A member pays if
+ * any of their subscriptions to the product is active, trialing or past_due;
+ * a member whose subscriptions all ended or left the product is not in the set.
  */
 export function buildPayingSet(
   subscriptions: Stripe.Subscription[],
@@ -60,12 +60,12 @@ export function buildPayingSet(
     if (fromMetadata && memberIdKind(fromMetadata)) return fromMetadata;
     return memberIdBySubscription.get(subscription.id);
   };
-  const memberIdByCustomer = new Map<string, string>();
+  const validIdsByCustomer = new Map<string, Set<string>>();
   for (const subscription of subscriptions) {
     const memberId = ownId(subscription);
-    if (memberId && !memberIdByCustomer.has(customerId(subscription))) {
-      memberIdByCustomer.set(customerId(subscription), memberId);
-    }
+    if (!memberId || !memberIdKind(memberId)) continue;
+    const ids = validIdsByCustomer.get(customerId(subscription)) ?? new Set<string>();
+    validIdsByCustomer.set(customerId(subscription), ids.add(memberId));
   }
   const set: PayingSet = { paying: new Set(), members: 0, borrowed: [], unmapped: [], unmappedPaying: [], invalid: [] };
   const members = new Set<string>();
@@ -73,17 +73,20 @@ export function buildPayingSet(
     if (!includesProduct(subscription, productId)) continue;
     const isPaying = PAYING_STATUSES.has(subscription.status);
     let memberId = ownId(subscription);
+    if (memberId && !memberIdKind(memberId)) {
+      if (!set.invalid.includes(memberId)) set.invalid.push(memberId);
+      memberId = undefined;
+    }
     if (!memberId) {
-      memberId = memberIdByCustomer.get(customerId(subscription));
-      if (memberId) set.borrowed.push({ subscription: subscription.id, memberId });
+      const candidates = validIdsByCustomer.get(customerId(subscription));
+      if (candidates?.size === 1) {
+        memberId = [...candidates][0];
+        set.borrowed.push({ subscription: subscription.id, memberId });
+      }
     }
     if (!memberId) {
       set.unmapped.push(subscription.id);
       if (isPaying) set.unmappedPaying.push(subscription.id);
-      continue;
-    }
-    if (!memberIdKind(memberId)) {
-      if (!set.invalid.includes(memberId)) set.invalid.push(memberId);
       continue;
     }
     members.add(memberId);

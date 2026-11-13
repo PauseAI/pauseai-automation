@@ -98,5 +98,51 @@ describe("buildPayingSet", () => {
     const set = build([subscription("a", "active")], { a: "junk" });
     expect(set.invalid).toEqual(["junk"]);
     expect(set.paying.size).toBe(0);
+    expect(set.members).toBe(0);
+  });
+
+  it("does not borrow when the customer's other subscriptions name different valid ids", () => {
+    const set = build(
+      [
+        subscription("a", "canceled", [PRODUCT], "cus_1"),
+        subscription("b", "canceled", [PRODUCT], "cus_1"),
+        subscription("c", "active", [PRODUCT], "cus_1"),
+      ],
+      { a: REC, b: MEM }
+    );
+    expect(set.borrowed).toEqual([]);
+    expect(set.unmappedPaying).toEqual(["c"]);
+  });
+
+  it("does not borrow an invalid id, and counts the subscription as unmapped", () => {
+    const set = build([subscription("a", "canceled", [PRODUCT], "cus_1"), subscription("b", "active", [PRODUCT], "cus_1")], {
+      a: "junk",
+    });
+    expect(set.borrowed).toEqual([]);
+    expect(set.unmappedPaying).toEqual(["b"]);
+    expect(set.invalid).toEqual(["junk"]);
+  });
+
+  it("borrows the one valid id when another subscription of the customer has an invalid one", () => {
+    const set = build(
+      [
+        subscription("a", "canceled", [PRODUCT], "cus_1"),
+        subscription("b", "canceled", [PRODUCT], "cus_1"),
+        subscription("c", "active", [PRODUCT], "cus_1"),
+      ],
+      { a: "junk", b: MEM }
+    );
+    expect(set.borrowed).toEqual([
+      { subscription: "a", memberId: MEM },
+      { subscription: "c", memberId: MEM },
+    ]);
+    expect([...set.paying]).toEqual([MEM]);
+    expect(set.unmapped).toEqual([]);
+  });
+
+  it("counts a paying subscription with an invalid id as unmapped paying", () => {
+    const set = build([subscription("a", "active")], { a: "junk" });
+    expect(set.unmappedPaying).toEqual(["a"]);
   });
 });
+

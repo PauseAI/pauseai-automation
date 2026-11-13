@@ -1,6 +1,6 @@
 import type Stripe from "stripe";
 import { syncAirtablePaying, DeadlineError, type AirtableClock, type AirtablePayingStore, type AirtableResult } from "./airtable-paying";
-import type { ReconcileResult } from "./crm";
+import { hasUnresolved, type ReconcileResult } from "./crm";
 import { buildPayingSet, memberIdKind, type PayingSet } from "./payment-status";
 
 export interface Page<T> {
@@ -26,12 +26,18 @@ export async function* paginate<T extends { id: string }>(
 
 type SessionRef = Pick<Stripe.Checkout.Session, "id" | "subscription" | "client_reference_id">;
 
-/** Subscription id to the `client_reference_id` of the checkout session that created it. */
+/**
+ * Subscription id to the `client_reference_id` of a checkout session that
+ * created it. A valid id wins over an invalid one, whichever session came first.
+ */
 export async function memberIdsBySubscription(sessions: AsyncIterable<SessionRef>): Promise<Map<string, string>> {
   const map = new Map<string, string>();
   for await (const session of sessions) {
     const subscription = typeof session.subscription === "string" ? session.subscription : session.subscription?.id;
-    if (subscription && session.client_reference_id) map.set(subscription, session.client_reference_id);
+    const memberId = session.client_reference_id;
+    if (!subscription || !memberId) continue;
+    const existing = map.get(subscription);
+    if (existing === undefined || (!memberIdKind(existing) && memberIdKind(memberId))) map.set(subscription, memberId);
   }
   return map;
 }
@@ -45,6 +51,8 @@ export interface SyncDeps {
   reconcile: ((memberIds: string[], options: { dryRun: boolean; deadline: number }) => Promise<ReconcileResult>) | null;
   airtable: AirtablePayingStore;
   dryRun: boolean;
+  /** Lifts Airtable's untick guard (PAYING_SYNC_AIRTABLE_ALLOW_REMOVALS_UNTIL). */
+  allowAirtableRemovals?: boolean;
   deadline: number;
   alert: (message: string) => void;
   clock?: AirtableClock;
@@ -99,6 +107,7 @@ export async function syncPaying(deps: SyncDeps): Promise<SyncSummary> {
     syncAirtablePaying(payingRecordIds, deps.airtable, {
       dryRun: deps.dryRun,
       deadline: deps.deadline,
+      allowRemovals: deps.allowAirtableRemovals,
       clock: deps.clock,
     }).catch((error) => {
       console.error(`${tag}: Airtable sync failed:`, error);
@@ -110,18 +119,29 @@ export async function syncPaying(deps: SyncDeps): Promise<SyncSummary> {
     typeof crm === "string"
       ? crm
       : `${crm.status}${crm.reason ? ` (${crm.reason})` : ""}, ${crm.setTrue} set paying, ${crm.setFalse} cleared, ` +
-        `unresolved ${JSON.stringify(Object.fromEntries(Object.entries(crm.unresolved).map(([k, v]) => [k, v.length])))}`;
+        `${crm.failed.length} failed`;
   const airtableLine =
     typeof airtable === "string"
       ? airtable
-      : `${airtable.status}, ${airtable.ticked} ticked, ${airtable.toTick.length} to tick, ` +
-        `${airtable.toUntick.length} to untick, ${airtable.written} written, ` +
+      : `${airtable.status}, ${airtable.ticked} ticked, ${airtable.redirected.length} redirected to merge survivors, ` +
+        `${airtable.toTick.length} to tick, ${airtable.toUntick.length} to untick` +
+        `${airtable.removalsAllowed ? " (untick guard lifted)" : ""}, ${airtable.written} written, ` +
         `${airtable.notFound.length} skipped (not found), ${airtable.failed} failed`;
   console.log(
     `${tag}: ${set.members} members, ${set.paying.size} paying, ${set.borrowed.length} borrowed ids, ` +
       `${set.unmapped.length} unmapped subscriptions, ${set.unmappedPaying.length} of them paying ` +
       `${JSON.stringify(set.unmappedPaying)}, ${set.invalid.length} invalid ids. CiviCRM: ${crmLine}. Airtable: ${airtableLine}.`
   );
+  if (typeof crm === "object") {
+    console.log(`${tag}: CiviCRM unresolved: ${JSON.stringify(crm.unresolved)}`);
+    if (crm.failed.length > 0) console.error(`${tag}: CiviCRM failed writes: ${JSON.stringify(crm.failed)}`);
+  }
+  if (typeof airtable === "object") {
+    for (const { from, to } of airtable.redirected) console.log(`${tag}: Airtable row ${from} was merged into ${to}`);
+    if (airtable.notFound.length > 0) {
+      console.warn(`${tag}: Airtable records not found, skipped: ${airtable.notFound.join(", ")}`);
+    }
+  }
   if (deps.dryRun) {
     // Everything a person needs to review before the first real run.
     if (typeof crm === "object") console.log(`${tag}: CiviCRM answer: ${JSON.stringify(crm.answer)}`);
@@ -130,13 +150,14 @@ export async function syncPaying(deps: SyncDeps): Promise<SyncSummary> {
       console.log(`${tag}: Airtable would tick ${JSON.stringify(airtable.toTick)}, untick ${JSON.stringify(airtable.toUntick)}`);
     }
   }
-  if (typeof airtable === "object" && airtable.notFound.length > 0) {
-    console.warn(`${tag}: Airtable records not found, skipped: ${airtable.notFound.join(", ")}`);
-  }
 
+  // A payer the stores do not record must never be silent.
   const problems = [
+    ...(set.unmappedPaying.length > 0 ? [`${set.unmappedPaying.length} paying subscriptions without a member id`] : []),
     ...(crm === "failed" ? ["CiviCRM failed"] : []),
     ...(typeof crm === "object" && crm.status !== "ok" ? [`CiviCRM ${crm.status} (${crm.reason})`] : []),
+    ...(typeof crm === "object" && hasUnresolved(crm.unresolved) ? ["CiviCRM could not resolve some paying ids"] : []),
+    ...(typeof crm === "object" && crm.failed.length > 0 ? [`${crm.failed.length} CiviCRM writes failed`] : []),
     ...(airtable === "failed" ? ["Airtable failed"] : []),
     ...(typeof airtable === "object" && airtable.status !== "ok" ? [`Airtable ${airtable.status}`] : []),
     ...(typeof airtable === "object" && airtable.failed > 0 ? [`${airtable.failed} Airtable writes failed`] : []),

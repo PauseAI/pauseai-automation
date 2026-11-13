@@ -1,19 +1,31 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { syncAirtablePaying, type AirtablePayingStore } from "../lib/airtable-paying";
+import { removalOverrideActive, syncAirtablePaying, type AirtablePayingStore, type AirtableRow } from "../lib/airtable-paying";
 import { fakeClock } from "./helpers";
 
 const rec = (n: number) => "rec" + String(n).padStart(14, "0");
 const ids = (from: number, to: number) => Array.from({ length: to - from }, (_, i) => rec(from + i));
 
-function store(ticked: string[], clock: ReturnType<typeof fakeClock>, missing: string[] = []) {
+/** A store over ticked ids and loser -> survivor merges, served in pages of `pageSize`. */
+function store(
+  ticked: string[],
+  clock: ReturnType<typeof fakeClock>,
+  options: { missing?: string[]; merged?: Record<string, string>; pageSize?: number } = {}
+) {
+  const pageSize = options.pageSize ?? 100;
+  const rows = {
+    ticked: ticked.map((id): AirtableRow => ({ id })),
+    merged: Object.entries(options.merged ?? {}).map(([id, to]): AirtableRow => ({ id, mergedInto: [to] })),
+  };
   const s = {
-    listTicked: vi.fn(async () => {
+    listPage: vi.fn(async (kind: "ticked" | "merged", offset: string | undefined) => {
       clock.starts.push(clock.now());
-      return ticked;
+      const start = Number(offset ?? 0);
+      const end = start + pageSize;
+      return { records: rows[kind].slice(start, end), offset: end < rows[kind].length ? String(end) : undefined };
     }),
     setPaying: vi.fn(async (id: string, _paying: boolean): Promise<"ok" | "not_found"> => {
       clock.starts.push(clock.now());
-      return missing.includes(id) ? "not_found" : "ok";
+      return options.missing?.includes(id) ? "not_found" : "ok";
     }),
   };
   return s satisfies AirtablePayingStore;
@@ -34,18 +46,49 @@ describe("syncAirtablePaying", () => {
     expect(result).toMatchObject({ status: "ok", ticked: 20, written: 2, failed: 0 });
   });
 
-  it("paces requests to at most 5 per second", async () => {
+  it("reads every page of ticked rows", async () => {
     const clock = fakeClock();
-    const s = store([], clock);
-    await syncAirtablePaying(new Set(ids(0, 6)), s, { dryRun: false, deadline: Infinity, clock });
+    const s = store(ids(0, 25), clock, { pageSize: 10 });
+    const result = await syncAirtablePaying(new Set(ids(0, 25)), s, { dryRun: false, deadline: Infinity, clock });
+    expect(s.listPage.mock.calls.filter((call) => call[0] === "ticked")).toHaveLength(3);
+    expect(result).toMatchObject({ ticked: 25, toTick: [], toUntick: [] });
+  });
+
+  it("paces requests, pages included, to at most 5 per second", async () => {
+    const clock = fakeClock();
+    const s = store(ids(100, 115), clock, { pageSize: 5 });
+    await syncAirtablePaying(new Set([...ids(100, 115), ...ids(0, 3)]), s, { dryRun: false, deadline: Infinity, clock });
     const gaps = clock.starts.slice(1).map((start, i) => start - clock.starts[i]);
-    expect(gaps).toHaveLength(6);
+    expect(gaps.length).toBeGreaterThan(5);
     for (const gap of gaps) expect(gap).toBeGreaterThanOrEqual(200);
   });
 
-  it("counts a row that does not exist as not found and goes on", async () => {
+  it("ticks the survivor for a paying merged-away row and never writes the merged-away row", async () => {
     const clock = fakeClock();
-    const s = store([], clock, [rec(1)]);
+    const s = store([rec(1)], clock, { merged: { [rec(1)]: rec(2) } });
+    const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, deadline: Infinity, clock });
+    expect(s.setPaying.mock.calls).toEqual([[rec(2), true]]);
+    expect(result.redirected).toEqual([{ from: rec(1), to: rec(2) }]);
+  });
+
+  it("does not untick a survivor whose merged-away row holds the subscription", async () => {
+    const clock = fakeClock();
+    const s = store([rec(2)], clock, { merged: { [rec(1)]: rec(2) } });
+    const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, deadline: Infinity, clock });
+    expect(s.setPaying).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ toTick: [], toUntick: [] });
+  });
+
+  it("follows a merge chain to its end", async () => {
+    const clock = fakeClock();
+    const s = store([], clock, { merged: { [rec(1)]: rec(2), [rec(2)]: rec(3) } });
+    await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, deadline: Infinity, clock });
+    expect(s.setPaying.mock.calls).toEqual([[rec(3), true]]);
+  });
+
+  it("counts a row that does not exist as skipped, not failed, and goes on", async () => {
+    const clock = fakeClock();
+    const s = store([], clock, { missing: [rec(1)] });
     const result = await syncAirtablePaying(new Set([rec(1), rec(2)]), s, { dryRun: false, deadline: Infinity, clock });
     expect(result).toMatchObject({ status: "ok", written: 1, notFound: [rec(1)], failed: 0 });
   });
@@ -57,6 +100,18 @@ describe("syncAirtablePaying", () => {
     expect(result.status).toBe("refused");
     expect(result.toUntick).toHaveLength(21);
     expect(s.setPaying).not.toHaveBeenCalled();
+  });
+
+  it("unticks past the guard when the override allows it", async () => {
+    const clock = fakeClock();
+    const s = store(ids(0, 100), clock);
+    const result = await syncAirtablePaying(new Set(ids(0, 79)), s, {
+      dryRun: false,
+      deadline: Infinity,
+      allowRemovals: true,
+      clock,
+    });
+    expect(result).toMatchObject({ status: "ok", written: 21, removalsAllowed: true });
   });
 
   it("allows up to 10 unticks on a small table", async () => {
@@ -71,7 +126,7 @@ describe("syncAirtablePaying", () => {
     const s = store([rec(0)], clock);
     const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: true, deadline: Infinity, clock });
     expect(s.setPaying).not.toHaveBeenCalled();
-    expect(result).toMatchObject({ toTick: [rec(1)], toUntick: [rec(0)], written: 0 });
+    expect(result).toMatchObject({ tickedIds: [rec(0)], toTick: [rec(1)], toUntick: [rec(0)], written: 0 });
   });
 
   it("retries a rate limit after 30 s, a few times at most, then counts a failure", async () => {
@@ -95,12 +150,31 @@ describe("syncAirtablePaying", () => {
     expect(result).toMatchObject({ failed: 1, written: 1 });
   });
 
-  it("stops at the deadline, without waiting past it", async () => {
+  it("checks the deadline before each page of the listing", async () => {
+    const clock = fakeClock();
+    const s = store(ids(0, 50), clock, { pageSize: 10 });
+    await expect(syncAirtablePaying(new Set(), s, { dryRun: true, deadline: 700, clock })).rejects.toThrow(/Deadline/);
+    expect(s.listPage.mock.calls.filter((call) => call[0] === "ticked").length).toBeLessThan(5);
+  });
+
+  it("stops writing at the deadline, without waiting past it", async () => {
     const clock = fakeClock();
     const s = store([], clock);
     s.setPaying.mockRejectedValueOnce(Object.assign(new Error("429"), { statusCode: 429 }));
     const result = await syncAirtablePaying(new Set(ids(0, 5)), s, { dryRun: false, deadline: 10_000, clock });
     expect(result.status).toBe("incomplete");
     expect(clock.now()).toBeLessThan(10_000);
+  });
+});
+
+describe("removalOverrideActive", () => {
+  const now = Date.parse("2026-11-13T12:00:00Z");
+  it("is active until its time, at most 24 hours ahead", () => {
+    expect(removalOverrideActive("2026-11-13T18:00:00Z", now)).toBe(true);
+    expect(removalOverrideActive("2026-11-14T12:00:00Z", now)).toBe(true);
+    expect(removalOverrideActive("2026-11-14T12:00:01Z", now)).toBe(false);
+    expect(removalOverrideActive("2026-11-13T11:59:59Z", now)).toBe(false);
+    expect(removalOverrideActive("not a time", now)).toBe(false);
+    expect(removalOverrideActive(undefined, now)).toBe(false);
   });
 });

@@ -45,19 +45,45 @@ export async function callCrm(
   return row as Record<string, unknown>;
 }
 
+/** Why sent ids named no member: lists of ids (capped by the CRM) or counts. */
+export interface Unresolved {
+  not_found: string[];
+  invalid: string[];
+  erased: number;
+  trashed: number;
+  not_a_member: number;
+}
+
 export interface ReconcileResult {
   status: "ok" | "refused";
-  /** `too_many_removals`, `too_many_changes` or `empty_set`. */
+  /** `too_many_removals`, `too_many_changes`, `empty_set` or `invalid_request`. */
   reason?: string;
   setTrue: number;
   setFalse: number;
-  /** Ids the CRM could not resolve to a member, by reason. */
-  unresolved: Record<string, string[]>;
+  unresolved: Unresolved;
+  /** Contacts whose write failed, as the CRM reports them. */
+  failed: unknown[];
   /** The whole answer, for the log: in a dry run it lists the contacts it would change. */
   answer: Record<string, unknown>;
 }
 
 const count = (value: unknown) => (typeof value === "number" ? value : 0);
+const list = (value: unknown) => (Array.isArray(value) ? value.map(String) : []);
+
+function readUnresolved(value: unknown): Unresolved {
+  const u = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
+  return {
+    not_found: list(u.not_found),
+    invalid: list(u.invalid),
+    erased: count(u.erased),
+    trashed: count(u.trashed),
+    not_a_member: count(u.not_a_member),
+  };
+}
+
+/** Whether any sent id named no member: each is a payer the CRM does not record. */
+export const hasUnresolved = (u: Unresolved) =>
+  u.not_found.length > 0 || u.invalid.length > 0 || u.erased > 0 || u.trashed > 0 || u.not_a_member > 0;
 
 /**
  * Sends the whole set of paying member ids to the CRM in one call. The CRM
@@ -77,10 +103,14 @@ export async function reconcilePayingInCrm(
     { member_ids: memberIds, dry_run: options.dryRun },
     Math.min(RECONCILE_TIMEOUT_MS, timeLeft)
   );
-  const unresolved = (answer.unresolved as Record<string, string[]> | undefined) ?? {};
-  if (answer.status === "refused") {
-    return { status: "refused", reason: String(answer.reason), setTrue: 0, setFalse: 0, unresolved, answer };
-  }
+  const result = {
+    setTrue: count(answer.set_true),
+    setFalse: count(answer.set_false),
+    unresolved: readUnresolved(answer.unresolved),
+    failed: Array.isArray(answer.failed) ? answer.failed : [],
+    answer,
+  };
+  if (answer.status === "refused") return { status: "refused", reason: String(answer.reason), ...result };
   if (answer.status !== "ok") throw new Error(`CiviCRM reconcile answered status ${String(answer.status)}`);
-  return { status: "ok", setTrue: count(answer.set_true), setFalse: count(answer.set_false), unresolved, answer };
+  return { status: "ok", ...result };
 }

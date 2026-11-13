@@ -7,11 +7,13 @@ async function* from<T>(items: T[]) {
   yield* items;
 }
 
+const NONE = { not_found: [], invalid: [], erased: 0, trashed: 0, not_a_member: 0 };
 const okReconcile = (fields: Partial<ReconcileResult> = {}): ReconcileResult => ({
   status: "ok",
   setTrue: 0,
   setFalse: 0,
-  unresolved: {},
+  unresolved: NONE,
+  failed: [],
   answer: {},
   ...fields,
 });
@@ -19,7 +21,9 @@ const okReconcile = (fields: Partial<ReconcileResult> = {}): ReconcileResult => 
 function deps(overrides: Partial<SyncDeps> = {}) {
   const reconcile = vi.fn(async (_ids: string[], _options: { dryRun: boolean; deadline: number }) => okReconcile());
   const airtable = {
-    listTicked: vi.fn(async () => [REC2]),
+    listPage: vi.fn(async (kind: "ticked" | "merged", _offset: string | undefined) => ({
+      records: kind === "ticked" ? [{ id: REC2 }] : [],
+    })),
     setPaying: vi.fn(async (_id: string, _paying: boolean) => "ok" as const),
   };
   const alert = vi.fn();
@@ -81,7 +85,8 @@ describe("syncPaying", () => {
     ]);
     expect(alert).not.toHaveBeenCalled();
     expect(summary.discovery).toBe("ok");
-    expect(vi.mocked(console.log).mock.calls.at(-1)![0]).toMatch(/3 members, 2 paying/);
+    const lines = vi.mocked(console.log).mock.calls.map((call) => String(call[0]));
+    expect(lines.some((line) => /3 members, 2 paying/.test(line))).toBe(true);
   });
 
   it("in a dry run calls reconcile with dry_run and writes nothing to Airtable", async () => {
@@ -109,7 +114,7 @@ describe("syncPaying", () => {
     expect(pages).toHaveBeenCalledTimes(3);
     expect(summary.discovery).toBe("failed");
     expect(reconcile).not.toHaveBeenCalled();
-    expect(airtable.listTicked).not.toHaveBeenCalled();
+    expect(airtable.listPage).not.toHaveBeenCalled();
     expect(alert).toHaveBeenCalledOnce();
   });
 
@@ -122,7 +127,7 @@ describe("syncPaying", () => {
     });
     await syncPaying(d);
     expect(reconcile).not.toHaveBeenCalled();
-    expect(airtable.listTicked).not.toHaveBeenCalled();
+    expect(airtable.listPage).not.toHaveBeenCalled();
     expect(alert).toHaveBeenCalledOnce();
   });
 
@@ -141,18 +146,53 @@ describe("syncPaying", () => {
     expect(alert.mock.calls[0][0]).toMatch(/CiviCRM failed/);
   });
 
-  it("reports unmapped paying subscriptions in the summary", async () => {
-    const { d } = deps({
+  it("reports and alerts unmapped paying subscriptions", async () => {
+    const { d, alert } = deps({
       listSubscriptions: () => from([subscription("sub_1", "active"), subscription("sub_lost", "active")]),
     });
     await syncPaying(d);
-    expect(vi.mocked(console.log).mock.calls.at(-1)![0]).toMatch(/1 unmapped subscriptions, 1 of them paying \["sub_lost"\]/);
+    const lines = vi.mocked(console.log).mock.calls.map((call) => String(call[0]));
+    expect(lines.some((line) => /1 unmapped subscriptions, 1 of them paying \["sub_lost"\]/.test(line))).toBe(true);
+    expect(alert.mock.calls[0][0]).toMatch(/1 paying subscriptions without a member id/);
+  });
+
+  it("logs the full unresolved on every run and alerts when any id is unresolved", async () => {
+    const { d, alert, reconcile } = deps();
+    const unresolved = { ...NONE, not_found: [MEM], trashed: 1 };
+    reconcile.mockResolvedValueOnce(okReconcile({ unresolved }));
+    await syncPaying(d);
+    const lines = vi.mocked(console.log).mock.calls.map((call) => String(call[0]));
+    expect(lines).toContain(`Paying sync: CiviCRM unresolved: ${JSON.stringify(unresolved)}`);
+    expect(alert.mock.calls[0][0]).toMatch(/could not resolve/);
+  });
+
+  it.each([{ erased: 1 }, { not_a_member: 2 }, { invalid: ["x"] }])("alerts on unresolved %o", async (fields) => {
+    const { d, alert, reconcile } = deps();
+    reconcile.mockResolvedValueOnce(okReconcile({ unresolved: { ...NONE, ...fields } }));
+    await syncPaying(d);
+    expect(alert).toHaveBeenCalledOnce();
+  });
+
+  it("alerts on failed CiviCRM writes", async () => {
+    const { d, alert, reconcile } = deps();
+    reconcile.mockResolvedValueOnce(okReconcile({ failed: [{ contact_id: 5, reason: "exception" }] }));
+    await syncPaying(d);
+    expect(alert.mock.calls[0][0]).toMatch(/1 CiviCRM writes failed/);
+  });
+
+  it("passes the untick override to the Airtable sync", async () => {
+    const many = Array.from({ length: 30 }, (_, i) => "rec" + String(i).padStart(14, "0"));
+    const { d, alert, airtable } = deps({ allowAirtableRemovals: true });
+    d.airtable.listPage = async (kind) => ({ records: kind === "ticked" ? many.map((id) => ({ id })) : [] });
+    await syncPaying(d);
+    expect(airtable.setPaying).toHaveBeenCalledTimes(31);
+    expect(alert).not.toHaveBeenCalled();
   });
 
   it("alerts when Airtable refuses the unticks", async () => {
     const many = Array.from({ length: 30 }, (_, i) => "rec" + String(i).padStart(14, "0"));
     const { d, alert } = deps();
-    d.airtable.listTicked = async () => many;
+    d.airtable.listPage = async (kind) => ({ records: kind === "ticked" ? many.map((id) => ({ id })) : [] });
     await syncPaying(d);
     expect(alert.mock.calls[0][0]).toMatch(/Airtable refused/);
   });
