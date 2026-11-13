@@ -85,6 +85,13 @@ function readUnresolved(value: unknown): Unresolved {
 export const hasUnresolved = (u: Unresolved) =>
   u.not_found.length > 0 || u.invalid.length > 0 || u.erased > 0 || u.trashed > 0 || u.not_a_member > 0;
 
+export interface ReconcileOptions {
+  dryRun: boolean;
+  deadline: number;
+  /** Paying Stripe subscriptions with no member id, which the CRM shows in System Status. */
+  unmappedPaying: number;
+}
+
 /**
  * Sends the whole set of paying member ids to the CRM in one call. The CRM
  * makes exactly those members paying, writing only the differences, or
@@ -93,14 +100,14 @@ export const hasUnresolved = (u: Unresolved) =>
 export async function reconcilePayingInCrm(
   config: CrmConfig,
   memberIds: string[],
-  options: { dryRun: boolean; deadline: number }
+  options: ReconcileOptions
 ): Promise<ReconcileResult> {
   const timeLeft = options.deadline - Date.now();
   if (timeLeft <= 0) throw new Error("Deadline passed before the CiviCRM reconcile");
   const answer = await callCrm(
     config,
     "PauseaiPayingMember/reconcile",
-    { member_ids: memberIds, dry_run: options.dryRun },
+    { member_ids: memberIds, dry_run: options.dryRun, unmapped_paying: options.unmappedPaying },
     Math.min(RECONCILE_TIMEOUT_MS, timeLeft)
   );
   const result = {

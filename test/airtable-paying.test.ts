@@ -5,19 +5,24 @@ import { fakeClock } from "./helpers";
 const rec = (n: number) => "rec" + String(n).padStart(14, "0");
 const ids = (from: number, to: number) => Array.from({ length: to - from }, (_, i) => rec(from + i));
 
-/** A store over ticked ids and loser -> survivor merges, served in pages of `pageSize`. */
+/** A store over ticked ids and merge links (loser -> links), served in pages of `pageSize`. */
 function store(
   ticked: string[],
   clock: ReturnType<typeof fakeClock>,
-  options: { missing?: string[]; merged?: Record<string, string>; pageSize?: number } = {}
+  options: { missing?: string[]; merged?: Record<string, string | string[]>; pageSize?: number } = {}
 ) {
   const pageSize = options.pageSize ?? 100;
   const rows = {
     ticked: ticked.map((id): AirtableRow => ({ id })),
-    merged: Object.entries(options.merged ?? {}).map(([id, to]): AirtableRow => ({ id, mergedInto: [to] })),
+    // Every row is listed for its links; most have none.
+    links: [
+      { id: rec(9000) },
+      ...Object.entries(options.merged ?? {}).map(([id, to]): AirtableRow => ({ id, mergedInto: [to].flat() })),
+      { id: rec(9001), mergedInto: [] },
+    ],
   };
   const s = {
-    listPage: vi.fn(async (kind: "ticked" | "merged", offset: string | undefined) => {
+    listPage: vi.fn(async (kind: "ticked" | "links", offset: string | undefined) => {
       clock.starts.push(clock.now());
       const start = Number(offset ?? 0);
       const end = start + pageSize;
@@ -86,6 +91,29 @@ describe("syncAirtablePaying", () => {
     expect(s.setPaying.mock.calls).toEqual([[rec(3), true]]);
   });
 
+  it("follows a chain of five links", async () => {
+    const clock = fakeClock();
+    const s = store([], clock, { merged: Object.fromEntries([1, 2, 3, 4, 5].map((n) => [rec(n), rec(n + 1)])) });
+    const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, deadline: Infinity, clock });
+    expect(s.setPaying.mock.calls).toEqual([[rec(6), true]]);
+    expect(result.brokenMerges).toEqual([]);
+  });
+
+  it.each([
+    ["a cycle", { [rec(1)]: rec(2), [rec(2)]: rec(1) }],
+    ["a self link", { [rec(1)]: rec(1) }],
+    ["a chain longer than five", Object.fromEntries([1, 2, 3, 4, 5, 6].map((n) => [rec(n), rec(n + 1)]))],
+    ["a fork", { [rec(1)]: [rec(2), rec(3)] }],
+    ["a fork further down", { [rec(1)]: rec(2), [rec(2)]: [rec(3), rec(4)] }],
+  ])("treats %s as a broken path: ticks nothing for it and unticks nothing", async (_name, merged) => {
+    const clock = fakeClock();
+    const s = store([rec(7), rec(40)], clock, { merged });
+    const result = await syncAirtablePaying(new Set([rec(1), rec(30)]), s, { dryRun: false, deadline: Infinity, clock });
+    expect(result.brokenMerges).toEqual([rec(1)]);
+    expect(result.toUntick).toEqual([]);
+    expect(s.setPaying.mock.calls).toEqual([[rec(30), true]]);
+  });
+
   it("counts a row that does not exist as skipped, not failed, and goes on", async () => {
     const clock = fakeClock();
     const s = store([], clock, { missing: [rec(1)] });
@@ -138,6 +166,27 @@ describe("syncAirtablePaying", () => {
     expect(s.setPaying).toHaveBeenCalledTimes(3);
     expect(clock.sleeps.filter((ms) => ms >= 30_000)).toHaveLength(2);
     expect(result).toMatchObject({ status: "ok", failed: 1, written: 0 });
+  });
+
+  it.each([null, undefined])("retries a timeout or connection error (status %s)", async (code) => {
+    const clock = fakeClock();
+    const s = store([], clock);
+    s.setPaying.mockRejectedValueOnce(Object.assign(new Error("timeout"), { statusCode: code }));
+    const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, deadline: Infinity, clock });
+    expect(s.setPaying).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ written: 1, failed: 0 });
+  });
+
+  it("retries a listing page that timed out", async () => {
+    const clock = fakeClock();
+    const s = store([rec(1)], clock);
+    const original = s.listPage.getMockImplementation()!;
+    s.listPage.mockImplementationOnce(async () => {
+      throw Object.assign(new Error("timeout"), { statusCode: null });
+    });
+    s.listPage.mockImplementation(original);
+    const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, deadline: Infinity, clock });
+    expect(result).toMatchObject({ status: "ok", ticked: 1 });
   });
 
   it("does not retry a client error", async () => {

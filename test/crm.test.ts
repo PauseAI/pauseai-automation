@@ -106,10 +106,14 @@ const PROBE_REFUSED = {
 describe("reconcilePayingInCrm", () => {
   it("makes one call with the whole set and reads a write's answer", async () => {
     const fetchMock = answers(PROBE_WRITE);
-    const result = await reconcilePayingInCrm(CONFIG, [REC, MEM], { dryRun: false, deadline: FAR });
+    const result = await reconcilePayingInCrm(CONFIG, [REC, MEM], { dryRun: false, deadline: FAR, unmappedPaying: 3 });
     expect(fetchMock).toHaveBeenCalledOnce();
     const init = (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1];
-    expect(JSON.parse((init.body as URLSearchParams).get("params")!)).toEqual({ member_ids: [REC, MEM], dry_run: false });
+    expect(JSON.parse((init.body as URLSearchParams).get("params")!)).toEqual({
+      member_ids: [REC, MEM],
+      dry_run: false,
+      unmapped_paying: 3,
+    });
     expect(result).toMatchObject({ status: "ok", setTrue: 2, setFalse: 1, unresolved: PROBE_UNRESOLVED, failed: [] });
     expect(hasUnresolved(result.unresolved)).toBe(true);
   });
@@ -117,20 +121,20 @@ describe("reconcilePayingInCrm", () => {
   it("reads the failed list", async () => {
     const failed = [{ contact_id: 104, reason: "exception" }];
     answers({ ...PROBE_WRITE, failed });
-    const result = await reconcilePayingInCrm(CONFIG, [REC], { dryRun: false, deadline: FAR });
+    const result = await reconcilePayingInCrm(CONFIG, [REC], { dryRun: false, deadline: FAR, unmappedPaying: 0 });
     expect(result.failed).toEqual(failed);
   });
 
   it("answers a refusal with its reason", async () => {
     answers(PROBE_REFUSED);
-    const result = await reconcilePayingInCrm(CONFIG, [REC], { dryRun: false, deadline: FAR });
+    const result = await reconcilePayingInCrm(CONFIG, [REC], { dryRun: false, deadline: FAR, unmappedPaying: 0 });
     expect(result).toMatchObject({ status: "refused", reason: "too_many_removals", answer: { removal_limit: 12 } });
     expect(hasUnresolved(result.unresolved)).toBe(false);
   });
 
   it("keeps a dry run's whole answer for the log", async () => {
     const fetchMock = answers(PROBE_DRY_RUN);
-    const result = await reconcilePayingInCrm(CONFIG, [REC], { dryRun: true, deadline: FAR });
+    const result = await reconcilePayingInCrm(CONFIG, [REC], { dryRun: true, deadline: FAR, unmappedPaying: 0 });
     const init = (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1];
     expect(JSON.parse((init.body as URLSearchParams).get("params")!)).toMatchObject({ dry_run: true });
     expect(result.answer).toEqual(PROBE_DRY_RUN);
@@ -138,7 +142,7 @@ describe("reconcilePayingInCrm", () => {
 
   it("rejects without calling once the deadline has passed", async () => {
     const fetchMock = answers(PROBE_WRITE);
-    await expect(reconcilePayingInCrm(CONFIG, [REC], { dryRun: false, deadline: Date.now() - 1 })).rejects.toThrow(/Deadline/);
+    await expect(reconcilePayingInCrm(CONFIG, [REC], { dryRun: false, deadline: Date.now() - 1, unmappedPaying: 0 })).rejects.toThrow(/Deadline/);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -147,7 +151,7 @@ describe("reconcilePayingInCrm", () => {
       throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
     });
     vi.stubGlobal("fetch", fetchMock);
-    await expect(reconcilePayingInCrm(CONFIG, [REC], { dryRun: false, deadline: FAR })).rejects.toThrow(/timeout/);
+    await expect(reconcilePayingInCrm(CONFIG, [REC], { dryRun: false, deadline: FAR, unmappedPaying: 0 })).rejects.toThrow(/timeout/);
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 });

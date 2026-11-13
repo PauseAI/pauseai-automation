@@ -7,7 +7,8 @@ import { requireEnv } from "./env";
 import { paginate, syncPaying, type SyncSummary } from "./paying-sync";
 
 // The link pauseai-civicrm's scripts/import/merge-members.py sets on a row
-// merged away into another; the CRM's import skips such rows too.
+// merged away into another; the CRM's import skips such rows too, testing the
+// link array itself as this sync does.
 const MERGED_INTO_FIELD = "Merged into";
 
 // Netlify stops a background function after 15 minutes. The whole run, Stripe
@@ -46,10 +47,13 @@ export async function runPayingSync(): Promise<SyncSummary> {
     reconcile: crm ? (memberIds, options) => reconcilePayingInCrm(crm, memberIds, options) : null,
     airtable: {
       listPage: async (rows, offset) => {
-        const shown = rows === "ticked" ? field : MERGED_INTO_FIELD;
         const response = await base.makeRequest({
           path: `/${encodeURIComponent(tableId)}`,
-          qs: { filterByFormula: `{${shown}}`, fields: [shown], pageSize: 100, ...(offset ? { offset } : {}) },
+          qs: {
+            ...(rows === "ticked" ? { filterByFormula: `{${field}}`, fields: [field] } : { fields: [MERGED_INTO_FIELD] }),
+            pageSize: 100,
+            ...(offset ? { offset } : {}),
+          },
         });
         const body = response.body as { records: { id: string; fields: Record<string, unknown> }[]; offset?: string };
         return {

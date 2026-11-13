@@ -25,8 +25,12 @@ export interface AirtableRow {
 }
 
 export interface AirtablePayingStore {
-  /** One page of the ticked rows, or of the merged-away rows. */
-  listPage: (rows: "ticked" | "merged", offset: string | undefined) => Promise<{ records: AirtableRow[]; offset?: string }>;
+  /**
+   * One page of the ticked rows, or of every row with its `Merged into` link.
+   * The links are read unfiltered: a formula on a link field sees the linked
+   * rows' primary field text, which can be blank.
+   */
+  listPage: (rows: "ticked" | "links", offset: string | undefined) => Promise<{ records: AirtableRow[]; offset?: string }>;
   /** Sets one row's payment status; `not_found` when the row does not exist. */
   setPaying: (recordId: string, paying: boolean) => Promise<"ok" | "not_found">;
 }
@@ -37,6 +41,12 @@ export interface AirtableResult {
   ticked: number;
   /** Every ticked live record id before the sync, for a dry run's review. */
   tickedIds: string[];
+  /**
+   * Paying record ids of merged-away rows whose merge path does not end on one
+   * surviving row (a cycle, a fork, too long). Nothing is ticked for them, and
+   * no row is unticked in the run.
+   */
+  brokenMerges: string[];
   /** Paying record ids of merged-away rows, and the surviving row ticked in their place. */
   redirected: { from: string; to: string }[];
   toTick: string[];
@@ -64,11 +74,13 @@ export function removalOverrideActive(until: string | undefined, now: number): b
 
 /**
  * Brings Airtable's payment status in line with the paying record ids. It
- * reads the ticked rows and the merged-away rows once, page by page, then
+ * reads the ticked rows and every row's merge link once, page by page, then
  * writes only the differences, one request at a time at Airtable's rate
  * limit, retrying a rate limit or server error a little, and never past the
  * deadline. A paying merged-away row ticks its surviving row instead, and
- * merged-away rows are never written. It refuses to untick more than max(10,
+ * merged-away rows are never written. A merge path that does not end on one
+ * survivor ticks nothing and stops all unticks for the run, since the set is
+ * then uncertain. It refuses to untick more than max(10,
  * 20%) of the ticked rows unless `allowRemovals`. A dry run reads and diffs only.
  */
 export async function syncAirtablePaying(
@@ -88,13 +100,14 @@ export async function syncAirtablePaying(
         return await call();
       } catch (error) {
         const code = statusCode(error);
-        const retryable = code === undefined || code === 429 || code >= 500;
+        // The client reports a timeout or connection error with a null status.
+        const retryable = code == null || code === 429 || code >= 500;
         if (!retryable || attempt >= MAX_ATTEMPTS) throw error;
         nextStart = clock.now() + (code === 429 ? RATE_LIMIT_WAIT_MS : 1_000 * attempt);
       }
     }
   };
-  const listAll = async (rows: "ticked" | "merged") => {
+  const listAll = async (rows: "ticked" | "links") => {
     const records: AirtableRow[] = [];
     let offset: string | undefined;
     do {
@@ -105,20 +118,33 @@ export async function syncAirtablePaying(
     return records;
   };
 
-  const mergedInto = new Map<string, string>();
-  for (const row of await listAll("merged")) {
-    if (row.mergedInto?.[0]) mergedInto.set(row.id, row.mergedInto[0]);
+  const mergedInto = new Map<string, string[]>();
+  for (const row of await listAll("links")) {
+    if (Array.isArray(row.mergedInto) && row.mergedInto.length > 0) mergedInto.set(row.id, row.mergedInto);
   }
-  const survivor = (id: string) => {
-    for (let hop = 0; hop < MAX_MERGE_HOPS && mergedInto.has(id); hop++) id = mergedInto.get(id)!;
-    return id;
+  // The surviving row a merged-away row leads to, or null when its path forks,
+  // cycles or runs past the hop limit.
+  const survivor = (id: string): string | null => {
+    const seen = new Set<string>([id]);
+    for (let hop = 0; hop < MAX_MERGE_HOPS; hop++) {
+      const links = mergedInto.get(id);
+      if (!links) return id;
+      if (links.length !== 1 || seen.has(links[0])) return null;
+      id = links[0];
+      seen.add(id);
+    }
+    return mergedInto.has(id) ? null : id;
   };
   const redirected: { from: string; to: string }[] = [];
+  const brokenMerges: string[] = [];
   const target = new Set<string>();
   for (const id of payingRecordIds) {
     const to = survivor(id);
-    if (to !== id) redirected.push({ from: id, to });
-    target.add(to);
+    if (to === null) brokenMerges.push(id);
+    else {
+      if (to !== id) redirected.push({ from: id, to });
+      target.add(to);
+    }
   }
 
   const ticked = (await listAll("ticked")).map((row) => row.id).filter((id) => !mergedInto.has(id));
@@ -127,9 +153,10 @@ export async function syncAirtablePaying(
     status: "ok",
     ticked: ticked.length,
     tickedIds: ticked,
+    brokenMerges,
     redirected,
     toTick: [...target].filter((id) => !tickedSet.has(id) && !mergedInto.has(id)),
-    toUntick: ticked.filter((id) => !target.has(id)),
+    toUntick: brokenMerges.length > 0 ? [] : ticked.filter((id) => !target.has(id)),
     removalsAllowed: Boolean(options.allowRemovals),
     written: 0,
     notFound: [],

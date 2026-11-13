@@ -1,6 +1,6 @@
 import type Stripe from "stripe";
 import { syncAirtablePaying, DeadlineError, type AirtableClock, type AirtablePayingStore, type AirtableResult } from "./airtable-paying";
-import { hasUnresolved, type ReconcileResult } from "./crm";
+import { hasUnresolved, type ReconcileOptions, type ReconcileResult } from "./crm";
 import { buildPayingSet, memberIdKind, type PayingSet } from "./payment-status";
 
 export interface Page<T> {
@@ -48,7 +48,7 @@ export interface SyncDeps {
   listSubscriptions: (deadline: number) => AsyncIterable<Stripe.Subscription>;
   listSessions: (deadline: number) => AsyncIterable<SessionRef>;
   /** Null when the CRM settings are unset. */
-  reconcile: ((memberIds: string[], options: { dryRun: boolean; deadline: number }) => Promise<ReconcileResult>) | null;
+  reconcile: ((memberIds: string[], options: ReconcileOptions) => Promise<ReconcileResult>) | null;
   airtable: AirtablePayingStore;
   dryRun: boolean;
   /** Lifts Airtable's untick guard (PAYING_SYNC_AIRTABLE_ALLOW_REMOVALS_UNTIL). */
@@ -99,7 +99,11 @@ export async function syncPaying(deps: SyncDeps): Promise<SyncSummary> {
 
   const [crm, airtable] = await Promise.all([
     deps.reconcile
-      ? deps.reconcile(paying, { dryRun: deps.dryRun, deadline: deps.deadline }).catch((error) => {
+      ? deps.reconcile(paying, {
+          dryRun: deps.dryRun,
+          deadline: deps.deadline,
+          unmappedPaying: set.unmappedPaying.length,
+        }).catch((error) => {
           console.error(`${tag}: CiviCRM reconcile failed:`, error);
           return "failed" as const;
         })
@@ -124,6 +128,7 @@ export async function syncPaying(deps: SyncDeps): Promise<SyncSummary> {
     typeof airtable === "string"
       ? airtable
       : `${airtable.status}, ${airtable.ticked} ticked, ${airtable.redirected.length} redirected to merge survivors, ` +
+        `${airtable.brokenMerges.length} broken merge paths, ` +
         `${airtable.toTick.length} to tick, ${airtable.toUntick.length} to untick` +
         `${airtable.removalsAllowed ? " (untick guard lifted)" : ""}, ${airtable.written} written, ` +
         `${airtable.notFound.length} skipped (not found), ${airtable.failed} failed`;
@@ -161,6 +166,9 @@ export async function syncPaying(deps: SyncDeps): Promise<SyncSummary> {
     ...(airtable === "failed" ? ["Airtable failed"] : []),
     ...(typeof airtable === "object" && airtable.status !== "ok" ? [`Airtable ${airtable.status}`] : []),
     ...(typeof airtable === "object" && airtable.failed > 0 ? [`${airtable.failed} Airtable writes failed`] : []),
+    ...(typeof airtable === "object" && airtable.brokenMerges.length > 0
+      ? [`Airtable merge paths that end on no single survivor, from ${airtable.brokenMerges.join(", ")}; no row unticked`]
+      : []),
   ];
   if (problems.length > 0) deps.alert(`${tag}: ${problems.join("; ")}`);
   return { dryRun: deps.dryRun, discovery: "ok", set, crm, airtable };

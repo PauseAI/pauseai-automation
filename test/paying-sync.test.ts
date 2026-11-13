@@ -21,7 +21,7 @@ const okReconcile = (fields: Partial<ReconcileResult> = {}): ReconcileResult => 
 function deps(overrides: Partial<SyncDeps> = {}) {
   const reconcile = vi.fn(async (_ids: string[], _options: { dryRun: boolean; deadline: number }) => okReconcile());
   const airtable = {
-    listPage: vi.fn(async (kind: "ticked" | "merged", _offset: string | undefined) => ({
+    listPage: vi.fn(async (kind: "ticked" | "links", _offset: string | undefined) => ({
       records: kind === "ticked" ? [{ id: REC2 }] : [],
     })),
     setPaying: vi.fn(async (_id: string, _paying: boolean) => "ok" as const),
@@ -78,7 +78,7 @@ describe("syncPaying", () => {
     const summary = await syncPaying(d);
     expect(reconcile).toHaveBeenCalledOnce();
     expect(reconcile.mock.calls[0][0].sort()).toEqual([MEM, REC].sort());
-    expect(reconcile.mock.calls[0][1]).toMatchObject({ dryRun: false });
+    expect(reconcile.mock.calls[0][1]).toMatchObject({ dryRun: false, unmappedPaying: 0 });
     expect(airtable.setPaying.mock.calls).toEqual([
       [REC, true],
       [REC2, false],
@@ -151,6 +151,7 @@ describe("syncPaying", () => {
       listSubscriptions: () => from([subscription("sub_1", "active"), subscription("sub_lost", "active")]),
     });
     await syncPaying(d);
+    expect(vi.mocked(d.reconcile!).mock.calls[0][1]).toMatchObject({ unmappedPaying: 1 });
     const lines = vi.mocked(console.log).mock.calls.map((call) => String(call[0]));
     expect(lines.some((line) => /1 unmapped subscriptions, 1 of them paying \["sub_lost"\]/.test(line))).toBe(true);
     expect(alert.mock.calls[0][0]).toMatch(/1 paying subscriptions without a member id/);
@@ -178,6 +179,16 @@ describe("syncPaying", () => {
     reconcile.mockResolvedValueOnce(okReconcile({ failed: [{ contact_id: 5, reason: "exception" }] }));
     await syncPaying(d);
     expect(alert.mock.calls[0][0]).toMatch(/1 CiviCRM writes failed/);
+  });
+
+  it("alerts on a broken Airtable merge path, naming the row", async () => {
+    const { d, alert, airtable } = deps();
+    d.airtable.listPage = async (kind) => ({
+      records: kind === "ticked" ? [{ id: REC2 }] : [{ id: REC, mergedInto: [REC2, MEM2] }],
+    });
+    await syncPaying(d);
+    expect(airtable.setPaying).not.toHaveBeenCalled();
+    expect(alert.mock.calls[0][0]).toMatch(new RegExp(`merge paths .*${REC}; no row unticked`));
   });
 
   it("passes the untick override to the Airtable sync", async () => {
