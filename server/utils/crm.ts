@@ -17,8 +17,10 @@ export function crmConfigFromEnv(env: NodeJS.ProcessEnv = process.env): CrmConfi
 
 /**
  * Records in CiviCRM whether the member with this id pays. A refusal is logged
- * and resolves, since a retry gets the same answer. A network error, a timeout,
- * an HTTP error or an answer without a status rejects, so Stripe retries.
+ * and resolves, since a retry gets the same answer, except `not_found`: a
+ * member can pay before their signup reaches the CRM, so that rejects, as do a
+ * network error, a timeout, an HTTP error and an answer without a status, and
+ * Stripe retries.
  */
 export async function setPayingInCrm(
   config: CrmConfig,
@@ -46,6 +48,9 @@ export async function setPayingInCrm(
   if (row?.status === "ok") {
     console.log(`CiviCRM contact ${row.contact_id} (member ${memberId}) updated with payment status: ${paying}`);
     return;
+  }
+  if (row?.status === "refused" && row.reason === "not_found") {
+    throw new Error(`CiviCRM has no member ${memberId} yet`);
   }
   if (row?.status === "refused") {
     console.warn(`CiviCRM refused payment status ${paying} for member ${memberId}: ${row.reason}`);

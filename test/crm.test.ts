@@ -41,11 +41,19 @@ describe("setPayingInCrm", () => {
     expect(init.signal).toBeInstanceOf(AbortSignal);
   });
 
-  it("logs a refusal with its reason and resolves", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  it.each(["erased", "trashed", "not_a_member", "invalid_request"])(
+    "logs a %s refusal and resolves",
+    async (reason) => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      answer(200, { values: [{ status: "refused", reason }] });
+      await expect(setPayingInCrm(CONFIG, MEM, false)).resolves.toBeUndefined();
+      expect(warn.mock.calls[0][0]).toContain(reason);
+    }
+  );
+
+  it("rejects a not_found refusal, so Stripe retries until the signup lands", async () => {
     answer(200, { values: [{ status: "refused", reason: "not_found" }] });
-    await expect(setPayingInCrm(CONFIG, MEM, false)).resolves.toBeUndefined();
-    expect(warn.mock.calls[0][0]).toContain("not_found");
+    await expect(setPayingInCrm(CONFIG, MEM, true)).rejects.toThrow(/no member/);
   });
 
   it.each([500, 503, 401])("rejects on HTTP %i", async (status) => {
