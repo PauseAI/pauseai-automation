@@ -21,6 +21,12 @@ export function memberIdKind(id: string | null | undefined): MemberIdKind | null
   return null;
 }
 
+/** How strongly an id names a member: a record or signup id over a Tally id, a Tally id over anything else. */
+export function memberIdStrength(id: string | null | undefined): number {
+  const kind = memberIdKind(id);
+  return kind === "airtable" || kind === "signup" ? 2 : kind === "tally" ? 1 : 0;
+}
+
 /** Whether a subscription includes the product. Only its first page of items is read. */
 export function includesProduct(subscription: Stripe.Subscription, productId: string): boolean {
   return subscription.items.data.some((item) => {
@@ -45,23 +51,21 @@ export interface PayingSet {
   unmappedPaying: string[];
   /** Member ids of no known shape. */
   invalid: string[];
-  /** Subscriptions to the product whose Tally id names exactly one Airtable row, and that row's record id. */
-  viaTally: { subscription: string; tallyId: string; memberId: string }[];
-  /** Subscriptions to the product whose Tally id names no Airtable row. */
-  tallyNotFound: { subscription: string; tallyId: string }[];
-  /** Subscriptions to the product whose Tally id names more than one Airtable row. */
-  tallyAmbiguous: { subscription: string; tallyId: string; rows: number }[];
+  /** Subscriptions to the product named by a Tally id, and how many Airtable rows hold it (1: resolved). */
+  tally: { subscription: string; tallyId: string; rows: number }[];
 }
 
 /**
  * The member ids that pay now. A subscription's member id is, in order: its
  * `member_id` metadata (so staff can repair a subscription in Stripe), its
  * checkout session's `client_reference_id`, or, when the customer's other
- * subscriptions name exactly one valid member id, that one. A Tally id becomes
- * the record id of the one Airtable row `tallyIndex` lists for it, and is no
- * id when it lists none or several. A member pays if
- * any of their subscriptions to the product is active, trialing or past_due;
- * a member whose subscriptions all ended or left the product is not in the set.
+ * subscriptions name exactly one valid member id, that one. A record or
+ * signup id from either source beats a Tally id. A Tally id becomes the record
+ * id of the one Airtable row `tallyIndex` lists for it, and is no id when it
+ * lists none or several; a customer with such a Tally id lends no id, since
+ * the subscription may belong to someone else. A member pays if any of their
+ * subscriptions to the product is active, trialing or past_due; a member
+ * whose subscriptions all ended or left the product is not in the set.
  */
 export function buildPayingSet(
   subscriptions: Stripe.Subscription[],
@@ -69,48 +73,38 @@ export function buildPayingSet(
   productId: string,
   tallyIndex: Map<string, string[]> = new Map()
 ): PayingSet {
-  const ownId = (subscription: Stripe.Subscription): { memberId?: string; tallyId?: string; rows?: string[] } => {
-    const fromMetadata = subscription.metadata?.member_id;
-    const memberId = fromMetadata && memberIdKind(fromMetadata) ? fromMetadata : memberIdBySubscription.get(subscription.id);
-    if (!memberId || memberIdKind(memberId) !== "tally") return { memberId };
-    const rows = tallyIndex.get(memberId) ?? [];
-    return { memberId: rows.length === 1 ? rows[0] : undefined, tallyId: memberId, rows };
+  const ownId = (subscription: Stripe.Subscription): { memberId?: string; tally?: { tallyId: string; rows: number } } => {
+    const sources = [subscription.metadata?.member_id, memberIdBySubscription.get(subscription.id)];
+    const direct = sources.find((id) => memberIdStrength(id) === 2);
+    if (direct) return { memberId: direct };
+    const tallyIds = sources.filter((id): id is string => memberIdKind(id) === "tally");
+    const tallyId = tallyIds.find((id) => tallyIndex.get(id)?.length === 1) ?? tallyIds[0];
+    if (!tallyId) return { memberId: sources[1] };
+    const rows = tallyIndex.get(tallyId) ?? [];
+    return { memberId: rows.length === 1 ? rows[0] : undefined, tally: { tallyId, rows: rows.length } };
   };
   const validIdsByCustomer = new Map<string, Set<string>>();
+  const unresolvedTallyCustomers = new Set<string>();
   for (const subscription of subscriptions) {
-    const { memberId } = ownId(subscription);
+    const { memberId, tally } = ownId(subscription);
+    if (tally && tally.rows !== 1) unresolvedTallyCustomers.add(customerId(subscription));
     if (!memberId || !memberIdKind(memberId)) continue;
     const ids = validIdsByCustomer.get(customerId(subscription)) ?? new Set<string>();
     validIdsByCustomer.set(customerId(subscription), ids.add(memberId));
   }
-  const set: PayingSet = {
-    paying: new Set(),
-    members: 0,
-    borrowed: [],
-    unmapped: [],
-    unmappedPaying: [],
-    invalid: [],
-    viaTally: [],
-    tallyNotFound: [],
-    tallyAmbiguous: [],
-  };
+  const set: PayingSet = { paying: new Set(), members: 0, borrowed: [], unmapped: [], unmappedPaying: [], invalid: [], tally: [] };
   const members = new Set<string>();
   for (const subscription of subscriptions) {
     if (!includesProduct(subscription, productId)) continue;
     const isPaying = PAYING_STATUSES.has(subscription.status);
     const own = ownId(subscription);
     let memberId = own.memberId;
-    if (own.tallyId !== undefined) {
-      const tallyId = own.tallyId;
-      if (memberId) set.viaTally.push({ subscription: subscription.id, tallyId, memberId });
-      else if (own.rows?.length) set.tallyAmbiguous.push({ subscription: subscription.id, tallyId, rows: own.rows.length });
-      else set.tallyNotFound.push({ subscription: subscription.id, tallyId });
-    }
+    if (own.tally) set.tally.push({ subscription: subscription.id, ...own.tally });
     if (memberId && !memberIdKind(memberId)) {
       if (!set.invalid.includes(memberId)) set.invalid.push(memberId);
       memberId = undefined;
     }
-    if (!memberId) {
+    if (!memberId && !unresolvedTallyCustomers.has(customerId(subscription))) {
       const candidates = validIdsByCustomer.get(customerId(subscription));
       if (candidates?.size === 1) {
         memberId = [...candidates][0];

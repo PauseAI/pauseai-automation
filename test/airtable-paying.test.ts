@@ -6,17 +6,23 @@ import {
   syncAirtablePaying,
   type AirtablePayingStore,
   type AirtableRow,
+  type AirtableRowSet,
 } from "../lib/airtable-paying";
 import { fakeClock } from "./helpers";
 
 const rec = (n: number) => "rec" + String(n).padStart(14, "0");
 const ids = (from: number, to: number) => Array.from({ length: to - from }, (_, i) => rec(from + i));
 
-/** A store over ticked ids and merge links (loser -> links), served in pages of `pageSize`. */
+/** A store over ticked ids, merge links (loser -> links) and Tally IDs (row -> value), served in pages of `pageSize`. */
 function store(
   ticked: string[],
   clock: ReturnType<typeof fakeClock>,
-  options: { missing?: string[]; merged?: Record<string, string | string[]>; pageSize?: number } = {}
+  options: {
+    missing?: string[];
+    merged?: Record<string, string | string[]>;
+    tally?: Record<string, unknown>;
+    pageSize?: number;
+  } = {}
 ) {
   const pageSize = options.pageSize ?? 100;
   const rows = {
@@ -27,9 +33,10 @@ function store(
       ...Object.entries(options.merged ?? {}).map(([id, to]): AirtableRow => ({ id, mergedInto: [to].flat() })),
       { id: rec(9001), mergedInto: [] },
     ],
+    tally: Object.entries(options.tally ?? {}).map(([id, tallyId]) => ({ id, tallyId }) as AirtableRow),
   };
   const s = {
-    listPage: vi.fn(async (kind: "ticked" | "links", offset: string | undefined) => {
+    listPage: vi.fn(async (kind: AirtableRowSet, offset: string | undefined) => {
       clock.starts.push(clock.now());
       const start = Number(offset ?? 0);
       const end = start + pageSize;
@@ -50,7 +57,7 @@ describe("syncAirtablePaying", () => {
     const clock = fakeClock();
     const s = store(ids(0, 20), clock);
     const paying = new Set([...ids(1, 20), rec(50)]);
-    const result = await syncAirtablePaying(paying, s, { dryRun: false, deadline: Infinity, clock });
+    const result = await syncAirtablePaying(paying, s, { dryRun: false, request: pacedAirtableRequests(Infinity, clock) });
     expect(s.setPaying.mock.calls).toEqual([
       [rec(50), true],
       [rec(0), false],
@@ -61,7 +68,7 @@ describe("syncAirtablePaying", () => {
   it("reads every page of ticked rows", async () => {
     const clock = fakeClock();
     const s = store(ids(0, 25), clock, { pageSize: 10 });
-    const result = await syncAirtablePaying(new Set(ids(0, 25)), s, { dryRun: false, deadline: Infinity, clock });
+    const result = await syncAirtablePaying(new Set(ids(0, 25)), s, { dryRun: false, request: pacedAirtableRequests(Infinity, clock) });
     expect(s.listPage.mock.calls.filter((call) => call[0] === "ticked")).toHaveLength(3);
     expect(result).toMatchObject({ ticked: 25, toTick: [], toUntick: [] });
   });
@@ -69,7 +76,7 @@ describe("syncAirtablePaying", () => {
   it("paces requests, pages included, to at most 5 per second", async () => {
     const clock = fakeClock();
     const s = store(ids(100, 115), clock, { pageSize: 5 });
-    await syncAirtablePaying(new Set([...ids(100, 115), ...ids(0, 3)]), s, { dryRun: false, deadline: Infinity, clock });
+    await syncAirtablePaying(new Set([...ids(100, 115), ...ids(0, 3)]), s, { dryRun: false, request: pacedAirtableRequests(Infinity, clock) });
     const gaps = clock.starts.slice(1).map((start, i) => start - clock.starts[i]);
     expect(gaps.length).toBeGreaterThan(5);
     for (const gap of gaps) expect(gap).toBeGreaterThanOrEqual(200);
@@ -78,7 +85,7 @@ describe("syncAirtablePaying", () => {
   it("ticks the survivor for a paying merged-away row and never writes the merged-away row", async () => {
     const clock = fakeClock();
     const s = store([rec(1)], clock, { merged: { [rec(1)]: rec(2) } });
-    const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, deadline: Infinity, clock });
+    const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, request: pacedAirtableRequests(Infinity, clock) });
     expect(s.setPaying.mock.calls).toEqual([[rec(2), true]]);
     expect(result.redirected).toEqual([{ from: rec(1), to: rec(2) }]);
   });
@@ -86,7 +93,7 @@ describe("syncAirtablePaying", () => {
   it("does not untick a survivor whose merged-away row holds the subscription", async () => {
     const clock = fakeClock();
     const s = store([rec(2)], clock, { merged: { [rec(1)]: rec(2) } });
-    const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, deadline: Infinity, clock });
+    const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, request: pacedAirtableRequests(Infinity, clock) });
     expect(s.setPaying).not.toHaveBeenCalled();
     expect(result).toMatchObject({ toTick: [], toUntick: [] });
   });
@@ -94,14 +101,14 @@ describe("syncAirtablePaying", () => {
   it("follows a merge chain to its end", async () => {
     const clock = fakeClock();
     const s = store([], clock, { merged: { [rec(1)]: rec(2), [rec(2)]: rec(3) } });
-    await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, deadline: Infinity, clock });
+    await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, request: pacedAirtableRequests(Infinity, clock) });
     expect(s.setPaying.mock.calls).toEqual([[rec(3), true]]);
   });
 
   it("follows a chain of five links", async () => {
     const clock = fakeClock();
     const s = store([], clock, { merged: Object.fromEntries([1, 2, 3, 4, 5].map((n) => [rec(n), rec(n + 1)])) });
-    const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, deadline: Infinity, clock });
+    const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, request: pacedAirtableRequests(Infinity, clock) });
     expect(s.setPaying.mock.calls).toEqual([[rec(6), true]]);
     expect(result.brokenMerges).toEqual([]);
   });
@@ -115,7 +122,7 @@ describe("syncAirtablePaying", () => {
   ])("treats %s as a broken path: ticks nothing for it and unticks nothing", async (_name, merged) => {
     const clock = fakeClock();
     const s = store([rec(7), rec(40)], clock, { merged });
-    const result = await syncAirtablePaying(new Set([rec(1), rec(30)]), s, { dryRun: false, deadline: Infinity, clock });
+    const result = await syncAirtablePaying(new Set([rec(1), rec(30)]), s, { dryRun: false, request: pacedAirtableRequests(Infinity, clock) });
     expect(result.brokenMerges).toEqual([rec(1)]);
     expect(result.toUntick).toEqual([]);
     expect(s.setPaying.mock.calls).toEqual([[rec(30), true]]);
@@ -124,14 +131,14 @@ describe("syncAirtablePaying", () => {
   it("counts a row that does not exist as skipped, not failed, and goes on", async () => {
     const clock = fakeClock();
     const s = store([], clock, { missing: [rec(1)] });
-    const result = await syncAirtablePaying(new Set([rec(1), rec(2)]), s, { dryRun: false, deadline: Infinity, clock });
+    const result = await syncAirtablePaying(new Set([rec(1), rec(2)]), s, { dryRun: false, request: pacedAirtableRequests(Infinity, clock) });
     expect(result).toMatchObject({ status: "ok", written: 1, notFound: [rec(1)], failed: 0 });
   });
 
   it("refuses to untick more than max(10, 20%) of the ticked rows", async () => {
     const clock = fakeClock();
     const s = store(ids(0, 100), clock);
-    const result = await syncAirtablePaying(new Set(ids(0, 79)), s, { dryRun: false, deadline: Infinity, clock });
+    const result = await syncAirtablePaying(new Set(ids(0, 79)), s, { dryRun: false, request: pacedAirtableRequests(Infinity, clock) });
     expect(result.status).toBe("refused");
     expect(result.toUntick).toHaveLength(21);
     expect(s.setPaying).not.toHaveBeenCalled();
@@ -142,9 +149,8 @@ describe("syncAirtablePaying", () => {
     const s = store(ids(0, 100), clock);
     const result = await syncAirtablePaying(new Set(ids(0, 79)), s, {
       dryRun: false,
-      deadline: Infinity,
       allowRemovals: true,
-      clock,
+      request: pacedAirtableRequests(Infinity, clock),
     });
     expect(result).toMatchObject({ status: "ok", written: 21, removalsAllowed: true });
   });
@@ -152,14 +158,14 @@ describe("syncAirtablePaying", () => {
   it("allows up to 10 unticks on a small table", async () => {
     const clock = fakeClock();
     const s = store(ids(0, 12), clock);
-    const result = await syncAirtablePaying(new Set(ids(0, 2)), s, { dryRun: false, deadline: Infinity, clock });
+    const result = await syncAirtablePaying(new Set(ids(0, 2)), s, { dryRun: false, request: pacedAirtableRequests(Infinity, clock) });
     expect(result).toMatchObject({ status: "ok", written: 10 });
   });
 
   it("writes nothing in a dry run", async () => {
     const clock = fakeClock();
     const s = store([rec(0)], clock);
-    const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: true, deadline: Infinity, clock });
+    const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: true, request: pacedAirtableRequests(Infinity, clock) });
     expect(s.setPaying).not.toHaveBeenCalled();
     expect(result).toMatchObject({ tickedIds: [rec(0)], toTick: [rec(1)], toUntick: [rec(0)], written: 0 });
   });
@@ -169,7 +175,7 @@ describe("syncAirtablePaying", () => {
     const clock = fakeClock();
     const s = store([], clock);
     s.setPaying.mockRejectedValue(Object.assign(new Error("429"), { statusCode: 429 }));
-    const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, deadline: Infinity, clock });
+    const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, request: pacedAirtableRequests(Infinity, clock) });
     expect(s.setPaying).toHaveBeenCalledTimes(3);
     expect(clock.sleeps.filter((ms) => ms >= 30_000)).toHaveLength(2);
     expect(result).toMatchObject({ status: "ok", failed: 1, written: 0 });
@@ -179,7 +185,7 @@ describe("syncAirtablePaying", () => {
     const clock = fakeClock();
     const s = store([], clock);
     s.setPaying.mockRejectedValueOnce(Object.assign(new Error("timeout"), { statusCode: code }));
-    const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, deadline: Infinity, clock });
+    const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, request: pacedAirtableRequests(Infinity, clock) });
     expect(s.setPaying).toHaveBeenCalledTimes(2);
     expect(result).toMatchObject({ written: 1, failed: 0 });
   });
@@ -192,7 +198,7 @@ describe("syncAirtablePaying", () => {
       throw Object.assign(new Error("timeout"), { statusCode: null });
     });
     s.listPage.mockImplementation(original);
-    const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, deadline: Infinity, clock });
+    const result = await syncAirtablePaying(new Set([rec(1)]), s, { dryRun: false, request: pacedAirtableRequests(Infinity, clock) });
     expect(result).toMatchObject({ status: "ok", ticked: 1 });
   });
 
@@ -201,7 +207,7 @@ describe("syncAirtablePaying", () => {
     const clock = fakeClock();
     const s = store([], clock);
     s.setPaying.mockRejectedValueOnce(Object.assign(new Error("422"), { statusCode: 422 }));
-    const result = await syncAirtablePaying(new Set([rec(1), rec(2)]), s, { dryRun: false, deadline: Infinity, clock });
+    const result = await syncAirtablePaying(new Set([rec(1), rec(2)]), s, { dryRun: false, request: pacedAirtableRequests(Infinity, clock) });
     expect(s.setPaying).toHaveBeenCalledTimes(2);
     expect(result).toMatchObject({ failed: 1, written: 1 });
   });
@@ -209,7 +215,7 @@ describe("syncAirtablePaying", () => {
   it("checks the deadline before each page of the listing", async () => {
     const clock = fakeClock();
     const s = store(ids(0, 50), clock, { pageSize: 10 });
-    await expect(syncAirtablePaying(new Set(), s, { dryRun: true, deadline: 700, clock })).rejects.toThrow(/Deadline/);
+    await expect(syncAirtablePaying(new Set(), s, { dryRun: true, request: pacedAirtableRequests(700, clock) })).rejects.toThrow(/Deadline/);
     expect(s.listPage.mock.calls.filter((call) => call[0] === "ticked").length).toBeLessThan(5);
   });
 
@@ -217,7 +223,7 @@ describe("syncAirtablePaying", () => {
     const clock = fakeClock();
     const s = store([], clock);
     s.setPaying.mockRejectedValueOnce(Object.assign(new Error("429"), { statusCode: 429 }));
-    const result = await syncAirtablePaying(new Set(ids(0, 5)), s, { dryRun: false, deadline: 10_000, clock });
+    const result = await syncAirtablePaying(new Set(ids(0, 5)), s, { dryRun: false, request: pacedAirtableRequests(10_000, clock) });
     expect(result.status).toBe("incomplete");
     expect(clock.now()).toBeLessThan(10_000);
   });
@@ -238,23 +244,29 @@ describe("removalOverrideActive", () => {
 describe("readTallyIndex", () => {
   it("maps each trimmed Tally id to every row holding it, across pages, paced", async () => {
     const clock = fakeClock();
-    const pages: Record<string, { records: AirtableRow[]; offset?: string }> = {
-      start: { records: [{ id: rec(1), tallyId: " KYle2vK\n" }, { id: rec(2), tallyId: "A7v1k6e" }], offset: "p2" },
-      p2: { records: [{ id: rec(3), tallyId: "KYle2vK" }, { id: rec(4), tallyId: "  " }, { id: rec(5) }] },
-    };
-    const s: AirtablePayingStore = {
-      listPage: vi.fn(async (kind, offset) => {
-        expect(kind).toBe("tally");
-        clock.starts.push(clock.now());
-        return pages[offset ?? "start"];
-      }),
-      setPaying: vi.fn(),
-    };
+    const s = store([], clock, {
+      pageSize: 2,
+      tally: { [rec(1)]: " KYle2vK\n", [rec(2)]: "A7v1k6e", [rec(3)]: "KYle2vK", [rec(4)]: "  " },
+    });
     const index = await readTallyIndex(s, pacedAirtableRequests(Infinity, clock));
     expect([...index]).toEqual([
       ["KYle2vK", [rec(1), rec(3)]],
       ["A7v1k6e", [rec(2)]],
     ]);
+    expect(s.listPage.mock.calls.map((call) => call[0])).toEqual(["tally", "tally"]);
     expect(clock.starts[1] - clock.starts[0]).toBeGreaterThanOrEqual(200);
+  });
+
+  it("skips values that are not text, as a retyped field returns", async () => {
+    const clock = fakeClock();
+    const s = store([], clock, { tally: { [rec(1)]: ["KYle2vK"], [rec(2)]: 7 } });
+    expect((await readTallyIndex(s, pacedAirtableRequests(Infinity, clock))).size).toBe(0);
+  });
+
+  it("matches case-sensitively", async () => {
+    const clock = fakeClock();
+    const s = store([], clock, { tally: { [rec(1)]: "kyle2vk" } });
+    const index = await readTallyIndex(s, pacedAirtableRequests(Infinity, clock));
+    expect(index.get("KYle2vK")).toBeUndefined();
   });
 });

@@ -148,13 +148,14 @@ describe("buildPayingSet", () => {
 });
 
 describe("buildPayingSet with Tally ids", () => {
+  const REC3 = "rec" + "C".repeat(14);
   const build = (subs: ReturnType<typeof subscription>[], map: Record<string, string>, index: Record<string, string[]>) =>
     buildPayingSet(subs, new Map(Object.entries(map)), PRODUCT, new Map(Object.entries(index)));
 
   it("resolves a Tally id on exactly one row to that row's record id", () => {
     const set = build([subscription("a", "active")], { a: TALLY }, { [TALLY]: [REC] });
     expect([...set.paying]).toEqual([REC]);
-    expect(set.viaTally).toEqual([{ subscription: "a", tallyId: TALLY, memberId: REC }]);
+    expect(set.tally).toEqual([{ subscription: "a", tallyId: TALLY, rows: 1 }]);
     expect(set.unmapped).toEqual([]);
     expect(set.invalid).toEqual([]);
   });
@@ -162,7 +163,7 @@ describe("buildPayingSet with Tally ids", () => {
   it("leaves a Tally id on no row unmapped and reports it", () => {
     const set = build([subscription("a", "active")], { a: TALLY }, { [TALLY2]: [REC] });
     expect(set.paying.size).toBe(0);
-    expect(set.tallyNotFound).toEqual([{ subscription: "a", tallyId: TALLY }]);
+    expect(set.tally).toEqual([{ subscription: "a", tallyId: TALLY, rows: 0 }]);
     expect(set.unmappedPaying).toEqual(["a"]);
     expect(set.invalid).toEqual([]);
   });
@@ -170,8 +171,13 @@ describe("buildPayingSet with Tally ids", () => {
   it("leaves a Tally id on several rows unmapped and reports how many", () => {
     const set = build([subscription("a", "active")], { a: TALLY }, { [TALLY]: [REC, REC2] });
     expect(set.paying.size).toBe(0);
-    expect(set.tallyAmbiguous).toEqual([{ subscription: "a", tallyId: TALLY, rows: 2 }]);
+    expect(set.tally).toEqual([{ subscription: "a", tallyId: TALLY, rows: 2 }]);
     expect(set.unmappedPaying).toEqual(["a"]);
+  });
+
+  it("matches Tally ids case-sensitively", () => {
+    const set = build([subscription("a", "active")], { a: TALLY.toLowerCase() }, { [TALLY]: [REC] });
+    expect(set.tally).toEqual([{ subscription: "a", tallyId: TALLY.toLowerCase(), rows: 0 }]);
   });
 
   it("lends a resolved Tally id to the customer's other subscriptions", () => {
@@ -184,20 +190,50 @@ describe("buildPayingSet with Tally ids", () => {
     expect(set.borrowed).toEqual([{ subscription: "new", memberId: REC }]);
   });
 
-  it("does not lend an unresolved Tally id", () => {
+  it("does not let an unresolved Tally id borrow another person's resolved id on the same customer", () => {
     const set = build(
-      [subscription("old", "canceled", [PRODUCT], "cus_1"), subscription("new", "active", [PRODUCT], "cus_1")],
-      { old: TALLY },
-      {}
+      [subscription("alice", "active", [PRODUCT], "cus_1"), subscription("bob", "canceled", [PRODUCT], "cus_1")],
+      { alice: TALLY, bob: TALLY2 },
+      { [TALLY]: [REC, REC2], [TALLY2]: [REC3] }
     );
     expect(set.borrowed).toEqual([]);
-    expect(set.unmappedPaying).toEqual(["new"]);
+    expect(set.paying.size).toBe(0);
+    expect(set.unmappedPaying).toEqual(["alice"]);
+  });
+
+  it("lends nothing from a customer with an unresolved Tally id", () => {
+    const set = build(
+      [
+        subscription("unknown", "canceled", [PRODUCT], "cus_1"),
+        subscription("known", "canceled", [PRODUCT], "cus_1"),
+        subscription("bare", "active", [PRODUCT], "cus_1"),
+      ],
+      { unknown: TALLY, known: TALLY2 },
+      { [TALLY2]: [REC3] }
+    );
+    expect(set.borrowed).toEqual([]);
+    expect(set.unmappedPaying).toEqual(["bare"]);
+    expect(set.unmapped).toEqual(["unknown", "bare"]);
+  });
+
+  it("takes a session's record id over an unresolvable Tally id in the metadata", () => {
+    const sub = subscription("a", "active");
+    sub.metadata = { member_id: TALLY };
+    const set = build([sub], { a: REC }, {});
+    expect([...set.paying]).toEqual([REC]);
+    expect(set.tally).toEqual([]);
+  });
+
+  it("takes a session's signup id over a resolvable Tally id in the metadata", () => {
+    const sub = subscription("a", "active");
+    sub.metadata = { member_id: TALLY };
+    expect([...build([sub], { a: MEM }, { [TALLY]: [REC] }).paying]).toEqual([MEM]);
   });
 
   it("still counts a junk id as invalid", () => {
     const set = build([subscription("a", "active")], { a: "KYle-vK" }, { "KYle-vK": [REC] });
     expect(set.invalid).toEqual(["KYle-vK"]);
     expect(set.paying.size).toBe(0);
-    expect(set.viaTally).toEqual([]);
+    expect(set.tally).toEqual([]);
   });
 });

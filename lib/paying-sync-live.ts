@@ -1,6 +1,6 @@
 import Airtable from "airtable";
 import Stripe from "stripe";
-import { removalOverrideActive } from "./airtable-paying";
+import { removalOverrideActive, type AirtableRowSet } from "./airtable-paying";
 import { alert } from "./alert";
 import { crmConfigFromEnv, reconcilePayingInCrm } from "./crm";
 import { requireEnv } from "./env";
@@ -34,7 +34,7 @@ export async function runPayingSync(): Promise<SyncSummary> {
   const table = base(tableId);
   const field = requireEnv("PAYMENT_STATUS_FIELD_NAME");
   const tallyField = process.env.TALLY_ID_FIELD_NAME || "Tally ID";
-  const query = {
+  const query: Record<AirtableRowSet, { filterByFormula?: string; fields: string[] }> = {
     ticked: { filterByFormula: `{${field}}`, fields: [field] },
     links: { fields: [MERGED_INTO_FIELD] },
     tally: { filterByFormula: `{${tallyField}} != ''`, fields: [tallyField] },

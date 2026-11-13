@@ -26,7 +26,7 @@ export interface AirtableRow {
   tallyId?: string;
 }
 
-export type AirtableRows = "ticked" | "links" | "tally";
+export type AirtableRowSet = "ticked" | "links" | "tally";
 
 export interface AirtablePayingStore {
   /**
@@ -34,7 +34,7 @@ export interface AirtablePayingStore {
    * of the rows with a Tally ID. The links are read unfiltered: a formula on a
    * link field sees the linked rows' primary field text, which can be blank.
    */
-  listPage: (rows: AirtableRows, offset: string | undefined) => Promise<{ records: AirtableRow[]; offset?: string }>;
+  listPage: (rows: AirtableRowSet, offset: string | undefined) => Promise<{ records: AirtableRow[]; offset?: string }>;
   /** Sets one row's payment status; `not_found` when the row does not exist. */
   setPaying: (recordId: string, paying: boolean) => Promise<"ok" | "not_found">;
 }
@@ -105,7 +105,7 @@ export function pacedAirtableRequests(deadline: number, clock: AirtableClock = r
   };
 }
 
-async function listAll(store: AirtablePayingStore, request: AirtableRequest, rows: AirtableRows) {
+async function listAll(store: AirtablePayingStore, request: AirtableRequest, rows: AirtableRowSet) {
   const records: AirtableRow[] = [];
   let offset: string | undefined;
   do {
@@ -120,6 +120,7 @@ async function listAll(store: AirtablePayingStore, request: AirtableRequest, row
 export async function readTallyIndex(store: AirtablePayingStore, request: AirtableRequest): Promise<Map<string, string[]>> {
   const index = new Map<string, string[]>();
   for (const row of await listAll(store, request, "tally")) {
+    // A field retyped away from text returns non-strings, which match nothing.
     const tallyId = typeof row.tallyId === "string" ? row.tallyId.trim() : "";
     if (tallyId) index.set(tallyId, [...(index.get(tallyId) ?? []), row.id]);
   }
@@ -129,20 +130,19 @@ export async function readTallyIndex(store: AirtablePayingStore, request: Airtab
 /**
  * Brings Airtable's payment status in line with the paying record ids. It
  * reads the ticked rows and every row's merge link once, page by page, then
- * writes only the differences, one request at a time at Airtable's rate
- * limit, retrying a rate limit or server error a little, and never past the
- * deadline. A paying merged-away row ticks its surviving row instead, and
- * merged-away rows are never written. A merge path that does not end on one
- * survivor ticks nothing and stops all unticks for the run, since the set is
- * then uncertain. It refuses to untick more than max(10,
- * 20%) of the ticked rows unless `allowRemovals`. A dry run reads and diffs only.
+ * writes only the differences, every request through `request`. A paying
+ * merged-away row ticks its surviving row instead, and merged-away rows are
+ * never written. A merge path that does not end on one survivor ticks nothing
+ * and stops all unticks for the run, since the set is then uncertain. It
+ * refuses to untick more than max(10, 20%) of the ticked rows unless
+ * `allowRemovals`. A dry run reads and diffs only.
  */
 export async function syncAirtablePaying(
   payingRecordIds: Set<string>,
   store: AirtablePayingStore,
-  options: { dryRun: boolean; deadline: number; allowRemovals?: boolean; clock?: AirtableClock; request?: AirtableRequest }
+  options: { dryRun: boolean; allowRemovals?: boolean; request: AirtableRequest }
 ): Promise<AirtableResult> {
-  const request = options.request ?? pacedAirtableRequests(options.deadline, options.clock);
+  const { request } = options;
 
   const mergedInto = new Map<string, string[]>();
   for (const row of await listAll(store, request, "links")) {
