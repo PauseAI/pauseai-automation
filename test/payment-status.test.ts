@@ -1,7 +1,6 @@
 import type Stripe from "stripe";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  AirtableRecordNotFoundError,
   isPayingSubscription,
   memberIdKind,
   recordSubscriptionStatus,
@@ -144,28 +143,5 @@ describe("writePaymentStatus", () => {
     await expect(writePaymentStatus(REC, true, w)).rejects.toThrow("airtable down");
     const logged = error.mock.calls.map((call) => (call[1] as Error).message);
     expect(logged).toEqual(["airtable down", "crm down"]);
-  });
-
-  it("resolves when the Airtable record is gone but the CRM write succeeded", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const w = writers(true);
-    w.airtable.mockRejectedValueOnce(new AirtableRecordNotFoundError("gone"));
-    await expect(writePaymentStatus(REC, true, w)).resolves.toBeUndefined();
-    expect(warn).toHaveBeenCalledOnce();
-  });
-
-  it("rejects when the Airtable record is gone and the CRM write failed too", async () => {
-    vi.spyOn(console, "error").mockImplementation(() => {});
-    const w = writers(true);
-    w.airtable.mockRejectedValueOnce(new AirtableRecordNotFoundError("gone"));
-    w.crm!.mockRejectedValueOnce(new Error("crm down"));
-    await expect(writePaymentStatus(REC, true, w)).rejects.toThrow("gone");
-  });
-
-  it("rejects when the Airtable record is gone and there are no CRM settings", async () => {
-    vi.spyOn(console, "error").mockImplementation(() => {});
-    const w = writers(false);
-    w.airtable.mockRejectedValueOnce(new AirtableRecordNotFoundError("gone"));
-    await expect(writePaymentStatus(REC, true, w)).rejects.toThrow("gone");
   });
 });

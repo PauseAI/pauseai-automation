@@ -27,9 +27,6 @@ export function isPayingSubscription(subscription: Stripe.Subscription, productI
   );
 }
 
-/** Thrown by the Airtable writer when the record does not exist. */
-export class AirtableRecordNotFoundError extends Error {}
-
 type PaymentStatusWriter = (memberId: string, status: boolean) => Promise<void>;
 
 export interface PaymentStatusWriters {
@@ -41,9 +38,8 @@ export interface PaymentStatusWriters {
 /**
  * Writes the payment status to Airtable (Airtable record ids only) and to
  * CiviCRM (every id). An id of neither shape is logged and ignored, since a
- * retry cannot fix it, and so is a missing Airtable record when the CRM write
- * succeeded. Both writes are idempotent, so when either fails this logs every
- * failure and rejects, and Stripe retries both.
+ * retry cannot fix it. Both writes are idempotent, so when either fails this
+ * logs every failure and rejects, and Stripe retries both.
  */
 export async function writePaymentStatus(
   memberId: string | null,
@@ -65,16 +61,9 @@ export async function writePaymentStatus(
     ...(kind === "airtable" ? [writers.airtable(memberId, status)] : []),
     ...(writers.crm ? [writers.crm(memberId, status)] : []),
   ];
-  const results = await Promise.allSettled(writes);
-  const crmSucceeded = writers.crm !== null && results[results.length - 1].status === "fulfilled";
-  const failures = results
+  const failures = (await Promise.allSettled(writes))
     .filter((result): result is PromiseRejectedResult => result.status === "rejected")
-    .map((result) => result.reason)
-    .filter((reason) => {
-      if (!(reason instanceof AirtableRecordNotFoundError && crmSucceeded)) return true;
-      console.warn(`Airtable record ${memberId} not found; payment status recorded in CiviCRM only`);
-      return false;
-    });
+    .map((result) => result.reason);
   for (const failure of failures) {
     console.error(`Payment status ${status} for member ${memberId} not recorded:`, failure);
   }

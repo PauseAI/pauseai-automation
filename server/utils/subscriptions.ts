@@ -47,11 +47,7 @@ export async function handleSubscriptionEvent(subscriptionId: string) {
  * @param status The payment status to set in Airtable.
  */
 async function setAirtablePaymentStatus(recordId: string, status: boolean) {
-  const record = await table.find(recordId).catch((error) => {
-    throw error?.statusCode === 404
-      ? new AirtableRecordNotFoundError(`Airtable record ${recordId} not found`)
-      : error;
-  });
+  const record = await table.find(recordId);
 
   await record.patchUpdate(
     Object.fromEntries([[paymentStatusFieldName, status]])

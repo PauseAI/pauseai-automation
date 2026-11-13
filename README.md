@@ -18,6 +18,11 @@ Set `CRM_URL` and `CRM_STRIPE_WEBHOOK_KEY` to turn this on. While either is unse
 
 For every event the webhook reads the subscription from Stripe as it is now: the member pays while it is `active`, `trialing` or `past_due` and includes `STRIPE_PRODUCT_ID`. So an event that arrives late, out of order or as a retry still records the current status.
 
-A `client_reference_id` of neither shape and a CiviCRM refusal other than `not_found` (`erased`, `trashed`, `not_a_member`, `invalid_request`) are logged and answered with 200, since a retry cannot fix them. A missing Airtable record is logged and ignored when CiviCRM recorded the status. Anything else fails the webhook so that Stripe retries the event: CiviCRM's `not_found` (a member can pay before their signup reaches the CRM), a failed Airtable write, a Stripe, Airtable or CiviCRM network error, timeout or HTTP error. Both writes are idempotent, so a retry repeats the one that succeeded harmlessly. Every call is time-bounded so the function answers well within Netlify's function time limit.
+A `client_reference_id` of neither shape and a CiviCRM refusal other than `not_found` (`erased`, `trashed`, `not_a_member`, `invalid_request`) are logged and answered with 200, since a retry cannot fix them. Anything else fails the webhook so that Stripe retries the event: CiviCRM's `not_found` (a member can pay before their signup reaches the CRM), a failed Airtable write (a missing record included), a Stripe, Airtable or CiviCRM network error, timeout or HTTP error. Both writes are idempotent, so a retry repeats the one that succeeded harmlessly. Every call is time-bounded so the function answers well within Netlify's function time limit.
+
+Accepted limits:
+
+- Two events for the same member handled at the same time can leave a stale value until the next event for that subscription.
+- Only the first page of a subscription's items is checked for `STRIPE_PRODUCT_ID`.
 
 Run the unit tests with `pnpm test`.
