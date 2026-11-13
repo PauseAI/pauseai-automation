@@ -10,7 +10,7 @@ import {
   type AirtableResult,
 } from "./airtable-paying";
 import { hasUnresolved, type ReconcileOptions, type ReconcileResult } from "./crm";
-import { buildPayingSet, memberIdKind, memberIdStrength, type PayingSet } from "./payment-status";
+import { buildPayingSet, memberIdKind, type PayingSet } from "./payment-status";
 
 export interface Page<T> {
   data: T[];
@@ -35,19 +35,15 @@ export async function* paginate<T extends { id: string }>(
 
 type SessionRef = Pick<Stripe.Checkout.Session, "id" | "subscription" | "client_reference_id">;
 
-/**
- * Subscription id to the `client_reference_id` of a checkout session that
- * created it. A record or signup id wins over a Tally id, and a Tally id over
- * an invalid one, whichever session came first.
- */
-export async function memberIdsBySubscription(sessions: AsyncIterable<SessionRef>): Promise<Map<string, string>> {
-  const map = new Map<string, string>();
+/** Subscription id to the distinct `client_reference_id`s of the checkout sessions that created it. */
+export async function memberIdsBySubscription(sessions: AsyncIterable<SessionRef>): Promise<Map<string, string[]>> {
+  const map = new Map<string, string[]>();
   for await (const session of sessions) {
     const subscription = typeof session.subscription === "string" ? session.subscription : session.subscription?.id;
     const memberId = session.client_reference_id;
     if (!subscription || !memberId) continue;
-    const existing = map.get(subscription);
-    if (existing === undefined || memberIdStrength(memberId) > memberIdStrength(existing)) map.set(subscription, memberId);
+    const ids = map.get(subscription) ?? [];
+    if (!ids.includes(memberId)) map.set(subscription, [...ids, memberId]);
   }
   return map;
 }
@@ -107,8 +103,8 @@ export async function syncPaying(deps: SyncDeps): Promise<SyncSummary> {
     deps.alert(`${tag}: ${stage} failed or ran past the deadline; nothing written`);
     return { dryRun: deps.dryRun, discovery: "failed", crm: "skipped", airtable: "failed" };
   }
-  for (const { subscription, memberId } of set.borrowed) {
-    console.log(`${tag}: subscription ${subscription} takes member id ${memberId} from its customer's other subscription`);
+  for (const { subscription, ids } of set.conflicting) {
+    console.warn(`${tag}: subscription ${subscription}: checkout sessions name different ids ${JSON.stringify(ids)}`);
   }
   for (const { subscription, tallyId, rows } of set.tally) {
     if (rows === 0) console.warn(`${tag}: subscription ${subscription}: Tally id ${tallyId} not found`);
@@ -160,7 +156,7 @@ export async function syncPaying(deps: SyncDeps): Promise<SyncSummary> {
         `${airtable.removalsAllowed ? " (untick guard lifted)" : ""}, ${airtable.written} written, ` +
         `${airtable.notFound.length} skipped (not found), ${airtable.failed} failed`;
   console.log(
-    `${tag}: ${set.members} members, ${set.paying.size} paying, ${set.borrowed.length} borrowed ids, ` +
+    `${tag}: ${set.members} members, ${set.paying.size} paying, ${set.conflicting.length} with conflicting ids, ` +
       `${tallyCount((rows) => rows === 1)} resolved via Tally id, ${tallyCount((rows) => rows === 0)} Tally ids not found, ` +
       `${tallyCount((rows) => rows > 1)} Tally ids on several rows, ` +
       `${set.unmapped.length} unmapped subscriptions, ${set.unmappedPaying.length} of them paying ` +

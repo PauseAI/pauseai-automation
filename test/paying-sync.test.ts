@@ -68,28 +68,17 @@ describe("paginate and memberIdsBySubscription", () => {
     const map = await memberIdsBySubscription(paginate(fetchPage));
     expect(fetchPage.mock.calls.map((call) => call[0])).toEqual([undefined, "cs_2", "cs_4"]);
     expect([...map]).toEqual([
-      ["sub_1", REC],
-      ["sub_4", MEM],
-      ["sub_5", MEM2],
+      ["sub_1", [REC]],
+      ["sub_4", [MEM]],
+      ["sub_5", [MEM2]],
     ]);
   });
 
-  it("prefers a record or signup id over a Tally id, and a Tally id over junk, whichever session came first", async () => {
+  it("keeps every distinct id a subscription's sessions name, in order", async () => {
     const map = await memberIdsBySubscription(
-      from([
-        session("cs_1", "sub_1", TALLY),
-        session("cs_2", "sub_1", REC),
-        session("cs_3", "sub_2", MEM),
-        session("cs_4", "sub_2", TALLY),
-        session("cs_5", "sub_3", "junk-id"),
-        session("cs_6", "sub_3", TALLY2),
-      ])
+      from([session("cs_1", "sub_1", TALLY), session("cs_2", "sub_1", REC), session("cs_3", "sub_1", TALLY)])
     );
-    expect([...map]).toEqual([
-      ["sub_1", REC],
-      ["sub_2", MEM],
-      ["sub_3", TALLY2],
-    ]);
+    expect([...map]).toEqual([["sub_1", [TALLY, REC]]]);
   });
 });
 
@@ -270,14 +259,14 @@ describe("syncPaying", () => {
       });
       await syncPaying(d);
       expect(reconcile.mock.calls[0][0]).toEqual([REC]);
-      expect(reconcile.mock.calls[0][1]).toMatchObject({ unmappedPaying: 1 });
+      expect(reconcile.mock.calls[0][1]).toMatchObject({ unmappedPaying: 2 });
       expect(airtable.setPaying.mock.calls).toEqual([[REC, true]]);
-      expect(logged("log").some((line) => line.includes(`subscription sub_t2 takes member id ${REC}`))).toBe(true);
+      expect(logged("warn")).toContain("Paying sync: subscription sub_t2 has no member id");
       expect(logged("warn")).toContain(`Paying sync: subscription sub_lost: Tally id ${TALLY2} not found`);
       expect(
         logged("log").some((line) => /1 resolved via Tally id, 1 Tally ids not found, 0 Tally ids on several rows/.test(line))
       ).toBe(true);
-      expect(alert.mock.calls[0][0]).toMatch(/1 paying subscriptions without a member id/);
+      expect(alert.mock.calls[0][0]).toMatch(/2 paying subscriptions without a member id/);
     });
 
     it("ticks the survivor when the Tally id's row was merged away", async () => {
@@ -291,7 +280,7 @@ describe("syncPaying", () => {
       expect(logged("log")).toContain(`Paying sync: Airtable row ${REC} was merged into ${REC3}`);
     });
 
-    it("leaves a Tally id on several rows unmapped, says how many, and lends nothing from its customer", async () => {
+    it("leaves a Tally id on several rows unmapped and says how many", async () => {
       const { d, reconcile } = tallyDeps({
         tally: [
           { id: REC, tallyId: TALLY },
@@ -302,7 +291,29 @@ describe("syncPaying", () => {
       await syncPaying(d);
       expect(reconcile.mock.calls[0][0]).toEqual([REC3]);
       expect(reconcile.mock.calls[0][1]).toMatchObject({ unmappedPaying: 2 });
+      expect(logged("log").some((line) => /1 resolved via Tally id, 0 Tally ids not found, 1 Tally ids on several rows/.test(line))).toBe(true);
       expect(logged("warn")).toContain(`Paying sync: subscription sub_t: Tally id ${TALLY} on 2 rows`);
+    });
+
+    it("writes nothing when the only chosen Tally id is a metadata one that matches no row, even if a session's would", async () => {
+      const repaired = subscription("sub_m", "active");
+      repaired.metadata = { member_id: TALLY };
+      const built = tallyDeps(
+        { tally: [{ id: REC, tallyId: TALLY2 }] },
+        { listSubscriptions: () => from([repaired]), listSessions: () => from([session("cs_m", "sub_m", TALLY2)]) }
+      );
+      expectNothingWritten(built, await syncPaying(built.d), /reading Tally IDs from Airtable failed/);
+    });
+
+    it("logs a subscription whose sessions name different ids", async () => {
+      const { d, reconcile } = deps({
+        listSubscriptions: () => from([subscription("sub_1", "active")]),
+        listSessions: () => from([session("cs_1", "sub_1", REC), session("cs_2", "sub_1", REC2)]),
+      });
+      await syncPaying(d);
+      expect(reconcile.mock.calls[0][1]).toMatchObject({ unmappedPaying: 1 });
+      expect(logged("warn")).toContain(`Paying sync: subscription sub_1: checkout sessions name different ids ["${REC}","${REC2}"]`);
+      expect(logged("log").some((line) => /0 paying, 1 with conflicting ids/.test(line))).toBe(true);
     });
 
     it("reads the Tally IDs on every run", async () => {
