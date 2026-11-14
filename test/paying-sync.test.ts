@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReconcileResult } from "../lib/crm";
-import { memberIdsBySubscription, paginate, syncPaying, type Page, type SyncDeps } from "../lib/paying-sync";
-import { MEM, MEM2, PRODUCT, REC, REC2, fakeClock, session, subscription } from "./helpers";
+import { memberIdsBySubscription, paginate, syncPaying, type Page, type SyncDeps, type SyncSummary } from "../lib/paying-sync";
+import type { AirtableRow, AirtableRowSet } from "../lib/airtable-paying";
+import { MEM, MEM2, PRODUCT, REC, REC2, TALLY, TALLY2, fakeClock, session, subscription } from "./helpers";
 
 async function* from<T>(items: T[]) {
   yield* items;
@@ -21,7 +22,7 @@ const okReconcile = (fields: Partial<ReconcileResult> = {}): ReconcileResult => 
 function deps(overrides: Partial<SyncDeps> = {}) {
   const reconcile = vi.fn(async (_ids: string[], _options: { dryRun: boolean; deadline: number }) => okReconcile());
   const airtable = {
-    listPage: vi.fn(async (kind: "ticked" | "links", _offset: string | undefined) => ({
+    listPage: vi.fn(async (kind: AirtableRowSet, _offset: string | undefined) => ({
       records: kind === "ticked" ? [{ id: REC2 }] : [],
     })),
     setPaying: vi.fn(async (_id: string, _paying: boolean) => "ok" as const),
@@ -54,6 +55,8 @@ beforeEach(() => {
 });
 afterEach(() => vi.restoreAllMocks());
 
+const logged = (level: "log" | "warn") => vi.mocked(console[level]).mock.calls.map((call) => String(call[0]));
+
 describe("paginate and memberIdsBySubscription", () => {
   it("maps subscriptions to member ids across pages", async () => {
     const pages: Record<string, Page<ReturnType<typeof session>>> = {
@@ -65,10 +68,17 @@ describe("paginate and memberIdsBySubscription", () => {
     const map = await memberIdsBySubscription(paginate(fetchPage));
     expect(fetchPage.mock.calls.map((call) => call[0])).toEqual([undefined, "cs_2", "cs_4"]);
     expect([...map]).toEqual([
-      ["sub_1", REC],
-      ["sub_4", MEM],
-      ["sub_5", MEM2],
+      ["sub_1", [REC]],
+      ["sub_4", [MEM]],
+      ["sub_5", [MEM2]],
     ]);
+  });
+
+  it("keeps every distinct id a subscription's sessions name, in order", async () => {
+    const map = await memberIdsBySubscription(
+      from([session("cs_1", "sub_1", TALLY), session("cs_2", "sub_1", REC), session("cs_3", "sub_1", TALLY)])
+    );
+    expect([...map]).toEqual([["sub_1", [TALLY, REC]]]);
   });
 });
 
@@ -85,8 +95,7 @@ describe("syncPaying", () => {
     ]);
     expect(alert).not.toHaveBeenCalled();
     expect(summary.discovery).toBe("ok");
-    const lines = vi.mocked(console.log).mock.calls.map((call) => String(call[0]));
-    expect(lines.some((line) => /3 members, 2 paying/.test(line))).toBe(true);
+    expect(logged("log").some((line) => /3 members, 2 paying/.test(line))).toBe(true);
   });
 
   it("in a dry run calls reconcile with dry_run and writes nothing to Airtable", async () => {
@@ -94,10 +103,10 @@ describe("syncPaying", () => {
     await syncPaying(d);
     expect(reconcile.mock.calls[0][1]).toMatchObject({ dryRun: true });
     expect(airtable.setPaying).not.toHaveBeenCalled();
-    const logged = vi.mocked(console.log).mock.calls.map((call) => String(call[0]));
-    expect(logged.some((line) => line.includes(`would tick ["${REC}"], untick ["${REC2}"]`))).toBe(true);
-    expect(logged.some((line) => line.includes(`ticked now: ["${REC2}"]`))).toBe(true);
-    expect(logged.some((line) => line.includes("CiviCRM answer:"))).toBe(true);
+    const lines = logged("log");
+    expect(lines.some((line) => line.includes(`would tick ["${REC}"], untick ["${REC2}"]`))).toBe(true);
+    expect(lines.some((line) => line.includes(`ticked now: ["${REC2}"]`))).toBe(true);
+    expect(lines.some((line) => line.includes("CiviCRM answer:"))).toBe(true);
   });
 
   it("writes nothing and alerts when listing from Stripe runs past the deadline", async () => {
@@ -152,8 +161,7 @@ describe("syncPaying", () => {
     });
     await syncPaying(d);
     expect(vi.mocked(d.reconcile!).mock.calls[0][1]).toMatchObject({ unmappedPaying: 1 });
-    const lines = vi.mocked(console.log).mock.calls.map((call) => String(call[0]));
-    expect(lines.some((line) => /1 unmapped subscriptions, 1 of them paying \["sub_lost"\]/.test(line))).toBe(true);
+    expect(logged("log").some((line) => /1 unmapped subscriptions, 1 of them paying \["sub_lost"\]/.test(line))).toBe(true);
     expect(alert.mock.calls[0][0]).toMatch(/1 paying subscriptions without a member id/);
   });
 
@@ -162,8 +170,7 @@ describe("syncPaying", () => {
     const unresolved = { ...NONE, not_found: [MEM], trashed: 1 };
     reconcile.mockResolvedValueOnce(okReconcile({ unresolved }));
     await syncPaying(d);
-    const lines = vi.mocked(console.log).mock.calls.map((call) => String(call[0]));
-    expect(lines).toContain(`Paying sync: CiviCRM unresolved: ${JSON.stringify(unresolved)}`);
+    expect(logged("log")).toContain(`Paying sync: CiviCRM unresolved: ${JSON.stringify(unresolved)}`);
     expect(alert.mock.calls[0][0]).toMatch(/could not resolve/);
   });
 
@@ -218,5 +225,192 @@ describe("syncPaying", () => {
     const lines = vi.mocked(console.warn).mock.calls.filter((call) => String(call[0]).includes("skipped 1 signup ids"));
     expect(lines).toHaveLength(1);
     expect(alert).not.toHaveBeenCalled();
+  });
+
+  describe("with Tally ids", () => {
+    const REC3 = "rec" + "C".repeat(14);
+    type Rows = Partial<Record<AirtableRowSet, { id: string; mergedInto?: string[]; tallyId?: unknown }[]>>;
+    const tallyDeps = (rows: Rows, overrides: Partial<SyncDeps> = {}) => {
+      const built = deps({
+        listSubscriptions: () =>
+          from([
+            subscription("sub_t", "active", [PRODUCT], "cus_t"),
+            subscription("sub_t2", "active", [PRODUCT], "cus_t"),
+            subscription("sub_lost", "active"),
+          ]),
+        listSessions: () => from([session("cs_t", "sub_t", TALLY), session("cs_lost", "sub_lost", TALLY2)]),
+        ...overrides,
+      });
+      built.airtable.listPage.mockImplementation(async (kind) => ({ records: (rows[kind] ?? []) as AirtableRow[] }));
+      return built;
+    };
+    const expectNothingWritten = (built: ReturnType<typeof tallyDeps>, summary: SyncSummary, alertPattern: RegExp) => {
+      expect(summary.discovery).toBe("failed");
+      expect(built.reconcile).not.toHaveBeenCalled();
+      expect(built.airtable.setPaying).not.toHaveBeenCalled();
+      expect(built.alert.mock.calls[0][0]).toMatch(alertPattern);
+    };
+
+    it("reads the Tally IDs before the CRM and sends it the resolved record id", async () => {
+      const { d, reconcile, airtable, alert } = tallyDeps({ tally: [{ id: REC, tallyId: ` ${TALLY}\n` }] });
+      reconcile.mockImplementationOnce(async () => {
+        expect(airtable.listPage.mock.calls.map((call) => call[0])).toEqual(["tally"]);
+        return okReconcile();
+      });
+      await syncPaying(d);
+      expect(reconcile.mock.calls[0][0]).toEqual([REC]);
+      expect(reconcile.mock.calls[0][1]).toMatchObject({ unmappedPaying: 2 });
+      expect(airtable.setPaying.mock.calls).toEqual([[REC, true]]);
+      expect(logged("warn")).toContain("Paying sync: subscription sub_t2 has no member id");
+      expect(logged("warn")).toContain(`Paying sync: subscription sub_lost: Tally id ${TALLY2} not found`);
+      expect(logged("warn")).not.toContain("Paying sync: subscription sub_lost has no member id");
+      expect(
+        logged("log").some((line) => /1 resolved via Tally id, 1 Tally ids not found, 0 Tally ids on several rows/.test(line))
+      ).toBe(true);
+      expect(alert.mock.calls[0][0]).toMatch(/2 paying subscriptions without a member id/);
+    });
+
+    it("ticks the survivor when the Tally id's row was merged away", async () => {
+      const { d, reconcile, airtable } = tallyDeps({
+        tally: [{ id: REC, tallyId: TALLY }],
+        links: [{ id: REC, mergedInto: [REC3] }],
+      });
+      await syncPaying(d);
+      expect(reconcile.mock.calls[0][0]).toEqual([REC]);
+      expect(airtable.setPaying.mock.calls).toEqual([[REC3, true]]);
+      expect(logged("log")).toContain(`Paying sync: Airtable row ${REC} was merged into ${REC3}`);
+    });
+
+    it("leaves a Tally id on several rows unmapped and says how many", async () => {
+      const { d, reconcile } = tallyDeps({
+        tally: [
+          { id: REC, tallyId: TALLY },
+          { id: REC2, tallyId: TALLY },
+          { id: REC3, tallyId: TALLY2 },
+        ],
+      });
+      await syncPaying(d);
+      expect(reconcile.mock.calls[0][0]).toEqual([REC3]);
+      expect(reconcile.mock.calls[0][1]).toMatchObject({ unmappedPaying: 2 });
+      expect(logged("log").some((line) => /1 resolved via Tally id, 0 Tally ids not found, 1 Tally ids on several rows/.test(line))).toBe(true);
+      expect(logged("warn")).toContain(`Paying sync: subscription sub_t: Tally id ${TALLY} on 2 rows`);
+    });
+
+    it("keeps a metadata Tally id that matches no row, does not mark the session's person paying, and writes", async () => {
+      const repaired = subscription("sub_m", "active");
+      repaired.metadata = { member_id: TALLY };
+      const { d, reconcile, alert } = tallyDeps(
+        { tally: [{ id: REC, tallyId: TALLY2 }] },
+        { listSubscriptions: () => from([repaired]), listSessions: () => from([session("cs_m", "sub_m", TALLY2)]) }
+      );
+      await syncPaying(d);
+      expect(reconcile.mock.calls[0][0]).toEqual([]);
+      expect(reconcile.mock.calls[0][1]).toMatchObject({ unmappedPaying: 1 });
+      expect(alert.mock.calls[0][0]).toMatch(/1 paying subscriptions without a member id/);
+    });
+
+    const legacy = (count: number, status: "active" | "canceled" = "active") => ({
+      listSubscriptions: () => from(Array.from({ length: count }, (_, i) => subscription(`sub_${i}`, status))),
+      listSessions: () => from(Array.from({ length: count }, (_, i) => session(`cs_${i}`, `sub_${i}`, `Tally${i}x`))),
+    });
+
+    it("writes with one or two unmatched Tally ids when the index has rows, counting them unmapped", async () => {
+      const { d, reconcile } = tallyDeps({ tally: [{ id: REC, tallyId: TALLY }] }, legacy(2));
+      const summary = await syncPaying(d);
+      expect(summary.discovery).toBe("ok");
+      expect(reconcile.mock.calls[0][1]).toMatchObject({ unmappedPaying: 2 });
+    });
+
+    it("writes nothing when three or more Tally ids match no row", async () => {
+      const built = tallyDeps({ tally: [{ id: REC, tallyId: TALLY }] }, legacy(3));
+      expectNothingWritten(built, await syncPaying(built.d), /none of 3 Tally ids matches an Airtable row; nothing written/);
+    });
+
+    it("writes when one of several Tally ids matches a row", async () => {
+      const { d, reconcile } = tallyDeps({ tally: [{ id: REC, tallyId: "Tally0x" }] }, legacy(4));
+      await syncPaying(d);
+      expect(reconcile.mock.calls[0][0]).toEqual([REC]);
+      expect(reconcile.mock.calls[0][1]).toMatchObject({ unmappedPaying: 3 });
+    });
+
+    it("does not count canceled legacy subscriptions that resolve as a misread", async () => {
+      const { d, reconcile } = tallyDeps(
+        { tally: ["Tally0x", "Tally1x", "Tally2x"].map((tallyId, i) => ({ id: "rec" + String(i).repeat(14), tallyId })) },
+        legacy(3, "canceled")
+      );
+      const summary = await syncPaying(d);
+      expect(summary.discovery).toBe("ok");
+      expect(reconcile.mock.calls[0][0]).toEqual([]);
+    });
+
+    it("logs a subscription whose sessions name different ids", async () => {
+      const { d, reconcile } = deps({
+        listSubscriptions: () => from([subscription("sub_1", "active")]),
+        listSessions: () => from([session("cs_1", "sub_1", REC), session("cs_2", "sub_1", REC2)]),
+      });
+      await syncPaying(d);
+      expect(reconcile.mock.calls[0][1]).toMatchObject({ unmappedPaying: 1 });
+      expect(logged("warn")).toContain(`Paying sync: subscription sub_1: checkout sessions name different ids ["${REC}","${REC2}"]`);
+      expect(logged("warn")).not.toContain("Paying sync: subscription sub_1 has no member id");
+      expect(logged("log").some((line) => /0 paying, 1 with conflicting ids/.test(line))).toBe(true);
+    });
+
+    it("warns once about member_id metadata of no known shape, truncated, and leaves the subscription unmapped", async () => {
+      const bad = subscription("sub_1", "active");
+      bad.metadata = { member_id: "x".repeat(100) };
+      const { d, reconcile } = deps({ listSubscriptions: () => from([bad]), listSessions: () => from([session("cs_1", "sub_1", REC)]) });
+      await syncPaying(d);
+      expect(reconcile.mock.calls[0][0]).toEqual([]);
+      const warnings = logged("warn").filter((line) => line.includes("sub_1") || line.includes("xxx"));
+      expect(warnings).toEqual([`Paying sync: subscription sub_1: member_id metadata of no known shape: "${"x".repeat(63)}`]);
+    });
+
+    it("reads the Tally IDs on every run", async () => {
+      const { d, airtable } = deps();
+      await syncPaying(d);
+      expect(airtable.listPage.mock.calls[0][0]).toBe("tally");
+    });
+
+    it("writes nothing when the Tally index is empty", async () => {
+      const built = tallyDeps({ tally: [] });
+      expectNothingWritten(built, await syncPaying(built.d), /Tally index empty, though 2 subscriptions carry Tally ids; nothing written/);
+    });
+
+    it("writes nothing when the Tally ID field returns values that are not text", async () => {
+      const built = tallyDeps({ tally: [{ id: REC, tallyId: [TALLY] }] });
+      expectNothingWritten(built, await syncPaying(built.d), /Tally index empty/);
+    });
+
+    it("writes nothing when reading the Tally IDs fails", async () => {
+      const built = tallyDeps({});
+      built.airtable.listPage.mockRejectedValue(Object.assign(new Error("forbidden"), { statusCode: 403 }));
+      expectNothingWritten(built, await syncPaying(built.d), /reading Tally IDs from Airtable failed/);
+    });
+
+    it("writes nothing when a later page of the Tally IDs fails", async () => {
+      const built = tallyDeps({});
+      built.airtable.listPage.mockImplementation(async (_kind, offset) => {
+        if (offset) throw Object.assign(new Error("forbidden"), { statusCode: 403 });
+        return { records: [{ id: REC, tallyId: TALLY }], offset: "p2" };
+      });
+      expectNothingWritten(built, await syncPaying(built.d), /reading Tally IDs from Airtable failed/);
+      expect(built.airtable.listPage).toHaveBeenCalledTimes(2);
+    });
+
+    it("writes nothing when the deadline passes before the Tally IDs are read", async () => {
+      const built = tallyDeps({ tally: [{ id: REC, tallyId: TALLY }] }, { deadline: 0 });
+      expectNothingWritten(built, await syncPaying(built.d), /reading Tally IDs from Airtable failed or ran past the deadline/);
+      expect(built.airtable.listPage).not.toHaveBeenCalled();
+    });
+
+    it("writes nothing when the last page of the Tally IDs returns after the deadline", async () => {
+      const clock = fakeClock();
+      const built = tallyDeps({}, { deadline: 1_000, clock });
+      built.airtable.listPage.mockImplementation(async () => {
+        await clock.sleep(5_000);
+        return { records: [{ id: REC, tallyId: TALLY }] };
+      });
+      expectNothingWritten(built, await syncPaying(built.d), /reading Tally IDs from Airtable failed or ran past the deadline/);
+    });
   });
 });

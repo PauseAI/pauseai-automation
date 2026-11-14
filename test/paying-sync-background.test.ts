@@ -15,10 +15,10 @@ afterEach(() => {
 });
 
 describe("paying-sync-background", () => {
-  it("throws after a failed Stripe listing, so Netlify retries", async () => {
+  it("throws after a failed discovery, so Netlify retries", async () => {
     vi.stubEnv("STRIPE_API_KEY", "sk_test");
     runPayingSync.mockResolvedValueOnce({ discovery: "failed" });
-    await expect(call()).rejects.toThrow(/listing from Stripe failed/);
+    await expect(call()).rejects.toThrow(/discovery failed/);
   });
 
   it("returns normally otherwise", async () => {

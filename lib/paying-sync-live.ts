@@ -1,6 +1,6 @@
 import Airtable from "airtable";
 import Stripe from "stripe";
-import { removalOverrideActive } from "./airtable-paying";
+import { removalOverrideActive, type AirtableRowSet } from "./airtable-paying";
 import { alert } from "./alert";
 import { crmConfigFromEnv, reconcilePayingInCrm } from "./crm";
 import { requireEnv } from "./env";
@@ -33,6 +33,12 @@ export async function runPayingSync(): Promise<SyncSummary> {
   const tableId = requireEnv("AIRTABLE_TABLE_ID");
   const table = base(tableId);
   const field = requireEnv("PAYMENT_STATUS_FIELD_NAME");
+  const tallyField = process.env.TALLY_ID_FIELD_NAME || "Tally ID";
+  const query: Record<AirtableRowSet, { filterByFormula?: string; fields: string[] }> = {
+    ticked: { filterByFormula: `{${field}}`, fields: [field] },
+    links: { fields: [MERGED_INTO_FIELD] },
+    tally: { filterByFormula: `{${tallyField}} != ''`, fields: [tallyField] },
+  };
   const crm = crmConfigFromEnv();
 
   return syncPaying({
@@ -50,7 +56,7 @@ export async function runPayingSync(): Promise<SyncSummary> {
         const response = await base.makeRequest({
           path: `/${encodeURIComponent(tableId)}`,
           qs: {
-            ...(rows === "ticked" ? { filterByFormula: `{${field}}`, fields: [field] } : { fields: [MERGED_INTO_FIELD] }),
+            ...query[rows],
             pageSize: 100,
             ...(offset ? { offset } : {}),
           },
@@ -60,6 +66,7 @@ export async function runPayingSync(): Promise<SyncSummary> {
           records: body.records.map((record) => ({
             id: record.id,
             mergedInto: record.fields[MERGED_INTO_FIELD] as string[] | undefined,
+            tallyId: record.fields[tallyField] as string | undefined,
           })),
           offset: body.offset,
         };

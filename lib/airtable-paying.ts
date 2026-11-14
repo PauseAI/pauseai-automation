@@ -22,15 +22,19 @@ export interface AirtableRow {
   id: string;
   /** The `Merged into` link: set on a row merged away into another. */
   mergedInto?: string[];
+  /** The Tally submission id the row was created from, as stored. */
+  tallyId?: string;
 }
+
+export type AirtableRowSet = "ticked" | "links" | "tally";
 
 export interface AirtablePayingStore {
   /**
-   * One page of the ticked rows, or of every row with its `Merged into` link.
-   * The links are read unfiltered: a formula on a link field sees the linked
-   * rows' primary field text, which can be blank.
+   * One page of the ticked rows, of every row with its `Merged into` link, or
+   * of the rows with a Tally ID. The links are read unfiltered: a formula on a
+   * link field sees the linked rows' primary field text, which can be blank.
    */
-  listPage: (rows: "ticked" | "links", offset: string | undefined) => Promise<{ records: AirtableRow[]; offset?: string }>;
+  listPage: (rows: AirtableRowSet, offset: string | undefined) => Promise<{ records: AirtableRow[]; offset?: string }>;
   /** Sets one row's payment status; `not_found` when the row does not exist. */
   setPaying: (recordId: string, paying: boolean) => Promise<"ok" | "not_found">;
 }
@@ -72,28 +76,20 @@ export function removalOverrideActive(until: string | undefined, now: number): b
   return Number.isFinite(expiry) && expiry > now && expiry - now <= MAX_OVERRIDE_AHEAD_MS;
 }
 
+/** Runs one Airtable request at a time. */
+export type AirtableRequest = <T>(call: () => Promise<T>) => Promise<T>;
+
 /**
- * Brings Airtable's payment status in line with the paying record ids. It
- * reads the ticked rows and every row's merge link once, page by page, then
- * writes only the differences, one request at a time at Airtable's rate
- * limit, retrying a rate limit or server error a little, and never past the
- * deadline. A paying merged-away row ticks its surviving row instead, and
- * merged-away rows are never written. A merge path that does not end on one
- * survivor ticks nothing and stops all unticks for the run, since the set is
- * then uncertain. It refuses to untick more than max(10,
- * 20%) of the ticked rows unless `allowRemovals`. A dry run reads and diffs only.
+ * Runs Airtable requests at the base's rate limit, retrying a rate limit or
+ * server error a little, and never past the deadline. Every request of a run
+ * goes through one of these, so the pacing holds across reads and writes.
  */
-export async function syncAirtablePaying(
-  payingRecordIds: Set<string>,
-  store: AirtablePayingStore,
-  options: { dryRun: boolean; deadline: number; allowRemovals?: boolean; clock?: AirtableClock }
-): Promise<AirtableResult> {
-  const clock = options.clock ?? realClock;
+export function pacedAirtableRequests(deadline: number, clock: AirtableClock = realClock): AirtableRequest {
   let nextStart = 0;
-  const request = async <T>(call: () => Promise<T>): Promise<T> => {
+  return async (call) => {
     for (let attempt = 1; ; attempt++) {
       const wait = Math.max(0, nextStart - clock.now());
-      if (clock.now() + wait >= options.deadline) throw new DeadlineError("Deadline passed during the Airtable sync");
+      if (clock.now() + wait >= deadline) throw new DeadlineError("Deadline passed during the Airtable sync");
       if (wait > 0) await clock.sleep(wait);
       nextStart = clock.now() + MIN_INTERVAL_MS;
       try {
@@ -107,19 +103,49 @@ export async function syncAirtablePaying(
       }
     }
   };
-  const listAll = async (rows: "ticked" | "links") => {
-    const records: AirtableRow[] = [];
-    let offset: string | undefined;
-    do {
-      const page = await request(() => store.listPage(rows, offset));
-      records.push(...page.records);
-      offset = page.offset;
-    } while (offset);
-    return records;
-  };
+}
+
+async function listAll(store: AirtablePayingStore, request: AirtableRequest, rows: AirtableRowSet) {
+  const records: AirtableRow[] = [];
+  let offset: string | undefined;
+  do {
+    const page = await request(() => store.listPage(rows, offset));
+    records.push(...page.records);
+    offset = page.offset;
+  } while (offset);
+  return records;
+}
+
+/** Each Tally id, trimmed, to the record ids of every row that holds it. */
+export async function readTallyIndex(store: AirtablePayingStore, request: AirtableRequest): Promise<Map<string, string[]>> {
+  const index = new Map<string, string[]>();
+  for (const row of await listAll(store, request, "tally")) {
+    // A field retyped away from text returns non-strings, which match nothing.
+    const tallyId = typeof row.tallyId === "string" ? row.tallyId.trim() : "";
+    if (tallyId) index.set(tallyId, [...(index.get(tallyId) ?? []), row.id]);
+  }
+  return index;
+}
+
+/**
+ * Brings Airtable's payment status in line with the paying record ids. It
+ * reads the ticked rows and every row's merge link once, page by page, then
+ * writes only the differences, every request through `request`. A paying
+ * merged-away row ticks its surviving row instead, and merged-away rows are
+ * never written. A merge path that does not end on one survivor ticks nothing
+ * and stops all unticks for the run, since the set is then uncertain. It
+ * refuses to untick more than max(10, 20%) of the ticked rows unless
+ * `allowRemovals`. A dry run reads and diffs only.
+ */
+export async function syncAirtablePaying(
+  payingRecordIds: Set<string>,
+  store: AirtablePayingStore,
+  options: { dryRun: boolean; allowRemovals?: boolean; request: AirtableRequest }
+): Promise<AirtableResult> {
+  const { request } = options;
 
   const mergedInto = new Map<string, string[]>();
-  for (const row of await listAll("links")) {
+  for (const row of await listAll(store, request, "links")) {
     if (Array.isArray(row.mergedInto) && row.mergedInto.length > 0) mergedInto.set(row.id, row.mergedInto);
   }
   // The surviving row a merged-away row leads to, or null when its path forks,
@@ -147,7 +173,7 @@ export async function syncAirtablePaying(
     }
   }
 
-  const ticked = (await listAll("ticked")).map((row) => row.id).filter((id) => !mergedInto.has(id));
+  const ticked = (await listAll(store, request, "ticked")).map((row) => row.id).filter((id) => !mergedInto.has(id));
   const tickedSet = new Set(ticked);
   const result: AirtableResult = {
     status: "ok",
