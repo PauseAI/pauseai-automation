@@ -5,7 +5,7 @@ const RATE_LIMIT_WAIT_MS = 30_000;
 const MAX_ATTEMPTS = 3;
 const MIN_DROP_GUARD = 10;
 const MAX_DROP_FRACTION = 0.2;
-export const MAX_MERGE_HOPS = 5;
+const MAX_MERGE_HOPS = 5;
 const MAX_OVERRIDE_AHEAD_MS = 24 * 3_600_000;
 
 export interface AirtableClock {
