@@ -1,6 +1,7 @@
 import type Stripe from "stripe";
 import {
   pacedAirtableRequests,
+  realClock,
   syncAirtablePaying,
   DeadlineError,
   type AirtableClock,
@@ -78,12 +79,13 @@ export interface SyncSummary {
  */
 export async function syncPaying(deps: SyncDeps): Promise<SyncSummary> {
   const tag = deps.dryRun ? "Paying sync (dry run)" : "Paying sync";
-  const airtableRequest = pacedAirtableRequests(deps.deadline, deps.clock);
   let set: PayingSet;
   try {
     const subscriptions: Stripe.Subscription[] = [];
     for await (const subscription of deps.listSubscriptions(deps.deadline)) subscriptions.push(subscription);
     const sessionIds = await memberIdsBySubscription(deps.listSessions(deps.deadline));
+    // paginate checks the deadline before each page, so a last page can still end past it.
+    if ((deps.clock ?? realClock).now() >= deps.deadline) throw new DeadlineError("Deadline passed listing from Stripe");
     set = buildPayingSet(subscriptions, sessionIds, deps.productId);
   } catch (error) {
     console.error(`${tag}: listing from Stripe failed, nothing written:`, error);
@@ -112,6 +114,7 @@ export async function syncPaying(deps: SyncDeps): Promise<SyncSummary> {
     console.warn(`${tag}: CRM settings unset, writing Airtable only; skipped ${signups} signup ids`);
   }
 
+  const airtableRequest = pacedAirtableRequests(deps.deadline, deps.clock);
   const [crm, airtable] = await Promise.all([
     deps.reconcile
       ? deps.reconcile(paying, {

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReconcileResult } from "../lib/crm";
-import { memberIdsBySubscription, paginate, syncPaying, type Page, type SyncDeps, type SyncSummary } from "../lib/paying-sync";
+import { memberIdsBySubscription, paginate, syncPaying, type Page, type SyncDeps } from "../lib/paying-sync";
 import type { AirtableRowSet } from "../lib/airtable-paying";
 import { MEM, MEM2, PRODUCT, REC, REC2, TALLY, TALLY2, fakeClock, session, subscription } from "./helpers";
 
@@ -127,6 +127,24 @@ describe("syncPaying", () => {
     expect(alert).toHaveBeenCalledOnce();
   });
 
+  it("writes nothing and alerts when the last Stripe page arrives past the deadline", async () => {
+    let now = 0;
+    const pages = vi.fn(async () => {
+      now += 1_100_000;
+      return { data: [subscription("sub_1", "active")], has_more: false };
+    });
+    const { d, reconcile, airtable, alert } = deps({
+      deadline: 1_000_000,
+      clock: { now: () => now, sleep: async () => {} },
+      listSubscriptions: (deadline) => paginate(pages, deadline, () => now),
+    });
+    const summary = await syncPaying(d);
+    expect(summary.discovery).toBe("failed");
+    expect(reconcile).not.toHaveBeenCalled();
+    expect(airtable.listPage).not.toHaveBeenCalled();
+    expect(alert).toHaveBeenCalledOnce();
+  });
+
   it("writes nothing and alerts when listing from Stripe fails", async () => {
     const { d, reconcile, airtable, alert } = deps({
       listSessions: () =>
@@ -227,8 +245,8 @@ describe("syncPaying", () => {
     expect(alert).not.toHaveBeenCalled();
   });
 
-  it("writes with only unmapped Tally ids left, logging each as unmapped", async () => {
-    const { d, reconcile, airtable } = deps({
+  it("writes when only canceled subscriptions name Tally ids, logging each as unmapped", async () => {
+    const { d, reconcile, alert } = deps({
       listSubscriptions: () =>
         from([subscription("sub_1", "active"), subscription("sub_2", "canceled"), subscription("sub_3", "canceled")]),
       listSessions: () => from([session("cs_1", "sub_1", REC), session("cs_2", "sub_2", TALLY), session("cs_3", "sub_3", TALLY2)]),
@@ -239,6 +257,7 @@ describe("syncPaying", () => {
     expect(reconcile.mock.calls[0][1]).toMatchObject({ unmappedPaying: 0 });
     expect(logged("warn")).toContain("Paying sync: subscription sub_2 has no member id");
     expect(logged("warn")).toContain(`Paying sync: member id of no known shape: "${TALLY}"`);
+    expect(alert).not.toHaveBeenCalled();
   });
 
   it("logs a subscription whose sessions name different ids", async () => {

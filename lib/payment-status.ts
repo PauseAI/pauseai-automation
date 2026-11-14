@@ -3,9 +3,9 @@ import type Stripe from "stripe";
 // The id the website passes to Stripe as `client_reference_id`: an Airtable
 // record id, or the signup id of a member who signed up in CiviCRM alone.
 // Subscriptions started before 2026-07-16 name a Tally submission id in their
-// checkout sessions, which is not recognised; all of them but a few canceled
-// ones carry a record id in their `member_id` metadata instead. Stripe passes
-// the id on from the checkout link, so it is user input.
+// checkout sessions, which is not recognised, so they need a record id in
+// their `member_id` metadata. Stripe passes the id on from the checkout link,
+// so it is user input.
 const AIRTABLE_RECORD_ID_REGEX = /^rec[a-zA-Z0-9]{14}$/;
 const SIGNUP_ID_REGEX = /^mem[a-zA-Z0-9]{22}$/;
 
