@@ -1,8 +1,6 @@
 import type Stripe from "stripe";
 import {
   pacedAirtableRequests,
-  readTallyIndex,
-  realClock,
   syncAirtablePaying,
   DeadlineError,
   type AirtableClock,
@@ -48,25 +46,6 @@ export async function memberIdsBySubscription(sessions: AsyncIterable<SessionRef
   return map;
 }
 
-// Fewer unmatched Tally ids than this, with rows in the index, are taken as
-// stray ids (a test checkout, say), not a misread field, so they cannot block
-// every run.
-const MIN_UNMATCHED_TALLY_IDS_FOR_MISREAD = 3;
-
-/**
- * Why the Tally ID field looks misread (renamed, retyped, or
- * TALLY_ID_FIELD_NAME wrong), or null. Writing then would clear every Tally
- * payer in the CRM.
- */
-function tallyIndexMisread(set: PayingSet, tallyIndex: Map<string, string[]>): string | null {
-  if (set.tally.length === 0) return null;
-  if (tallyIndex.size === 0) return `Tally index empty, though ${set.tally.length} subscriptions carry Tally ids`;
-  if (set.tally.length >= MIN_UNMATCHED_TALLY_IDS_FOR_MISREAD && !set.tally.some(({ rows }) => rows === 1)) {
-    return `none of ${set.tally.length} Tally ids matches an Airtable row`;
-  }
-  return null;
-}
-
 export interface SyncDeps {
   productId: string;
   /** Both list from Stripe and must reject once `deadline` has passed (see paginate). */
@@ -94,42 +73,25 @@ export interface SyncSummary {
 /**
  * Makes CiviCRM and Airtable hold exactly the members who pay now, as Stripe
  * says: the whole paying set goes to the CRM in one reconcile, and Airtable
- * gets the difference to its ticked rows. Tally ids are resolved to Airtable
- * record ids first, since the CRM knows members by record id. If listing from
- * Stripe or reading the Tally IDs fails or runs past the deadline, or the
- * Tally ID field looks misread, nothing is written.
+ * gets the difference to its ticked rows. If listing from Stripe fails or runs
+ * past the deadline, nothing is written.
  */
 export async function syncPaying(deps: SyncDeps): Promise<SyncSummary> {
   const tag = deps.dryRun ? "Paying sync (dry run)" : "Paying sync";
   const airtableRequest = pacedAirtableRequests(deps.deadline, deps.clock);
-  let stage = "listing from Stripe";
-  let tallyIndex = new Map<string, string[]>();
   let set: PayingSet;
   try {
     const subscriptions: Stripe.Subscription[] = [];
     for await (const subscription of deps.listSubscriptions(deps.deadline)) subscriptions.push(subscription);
     const sessionIds = await memberIdsBySubscription(deps.listSessions(deps.deadline));
-    stage = "reading Tally IDs from Airtable";
-    tallyIndex = await readTallyIndex(deps.airtable, airtableRequest);
-    if ((deps.clock ?? realClock).now() >= deps.deadline) throw new DeadlineError("Deadline passed reading Tally IDs");
-    set = buildPayingSet(subscriptions, sessionIds, deps.productId, tallyIndex);
+    set = buildPayingSet(subscriptions, sessionIds, deps.productId);
   } catch (error) {
-    console.error(`${tag}: ${stage} failed, nothing written:`, error);
-    deps.alert(`${tag}: ${stage} failed or ran past the deadline; nothing written`);
-    return { dryRun: deps.dryRun, discovery: "failed", crm: "skipped", airtable: "failed" };
-  }
-  const misread = tallyIndexMisread(set, tallyIndex);
-  if (misread) {
-    console.error(`${tag}: ${misread}, nothing written`);
-    deps.alert(`${tag}: ${misread}; nothing written`);
+    console.error(`${tag}: listing from Stripe failed, nothing written:`, error);
+    deps.alert(`${tag}: listing from Stripe failed or ran past the deadline; nothing written`);
     return { dryRun: deps.dryRun, discovery: "failed", crm: "skipped", airtable: "failed" };
   }
   for (const { subscription, ids } of set.conflicting) {
     console.warn(`${tag}: subscription ${subscription}: checkout sessions name different ids ${JSON.stringify(ids)}`);
-  }
-  for (const { subscription, tallyId, rows } of set.tally) {
-    if (rows === 0) console.warn(`${tag}: subscription ${subscription}: Tally id ${tallyId} not found`);
-    if (rows > 1) console.warn(`${tag}: subscription ${subscription}: Tally id ${tallyId} on ${rows} rows`);
   }
   const truncated = (id: string) => JSON.stringify(id).slice(0, 64);
   for (const { subscription, id } of set.invalidMetadata) {
@@ -137,7 +99,6 @@ export async function syncPaying(deps: SyncDeps): Promise<SyncSummary> {
   }
   const explained = new Set([
     ...set.conflicting.map(({ subscription }) => subscription),
-    ...set.tally.filter(({ rows }) => rows !== 1).map(({ subscription }) => subscription),
     ...set.invalidMetadata.map(({ subscription }) => subscription),
   ]);
   for (const id of set.unmapped) if (!explained.has(id)) console.warn(`${tag}: subscription ${id} has no member id`);
@@ -172,7 +133,6 @@ export async function syncPaying(deps: SyncDeps): Promise<SyncSummary> {
     }),
   ]);
 
-  const tallyCount = (test: (rows: number) => boolean) => set.tally.filter(({ rows }) => test(rows)).length;
   const crmLine =
     typeof crm === "string"
       ? crm
@@ -188,8 +148,6 @@ export async function syncPaying(deps: SyncDeps): Promise<SyncSummary> {
         `${airtable.notFound.length} skipped (not found), ${airtable.failed} failed`;
   console.log(
     `${tag}: ${set.members} members, ${set.paying.size} paying, ${set.conflicting.length} with conflicting ids, ` +
-      `${tallyCount((rows) => rows === 1)} resolved via Tally id, ${tallyCount((rows) => rows === 0)} Tally ids not found, ` +
-      `${tallyCount((rows) => rows > 1)} Tally ids on several rows, ` +
       `${set.unmapped.length} unmapped subscriptions, ${set.unmappedPaying.length} of them paying ` +
       `${JSON.stringify(set.unmappedPaying)}, ${set.invalid.length} invalid ids. CiviCRM: ${crmLine}. Airtable: ${airtableLine}.`
   );

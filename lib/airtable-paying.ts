@@ -22,17 +22,15 @@ export interface AirtableRow {
   id: string;
   /** The `Merged into` link: set on a row merged away into another. */
   mergedInto?: string[];
-  /** The Tally submission id the row was created from, as stored. */
-  tallyId?: string;
 }
 
-export type AirtableRowSet = "ticked" | "links" | "tally";
+export type AirtableRowSet = "ticked" | "links";
 
 export interface AirtablePayingStore {
   /**
-   * One page of the ticked rows, of every row with its `Merged into` link, or
-   * of the rows with a Tally ID. The links are read unfiltered: a formula on a
-   * link field sees the linked rows' primary field text, which can be blank.
+   * One page of the ticked rows, or of every row with its `Merged into` link.
+   * The links are read unfiltered: a formula on a link field sees the linked
+   * rows' primary field text, which can be blank.
    */
   listPage: (rows: AirtableRowSet, offset: string | undefined) => Promise<{ records: AirtableRow[]; offset?: string }>;
   /** Sets one row's payment status; `not_found` when the row does not exist. */
@@ -114,17 +112,6 @@ async function listAll(store: AirtablePayingStore, request: AirtableRequest, row
     offset = page.offset;
   } while (offset);
   return records;
-}
-
-/** Each Tally id, trimmed, to the record ids of every row that holds it. */
-export async function readTallyIndex(store: AirtablePayingStore, request: AirtableRequest): Promise<Map<string, string[]>> {
-  const index = new Map<string, string[]>();
-  for (const row of await listAll(store, request, "tally")) {
-    // A field retyped away from text returns non-strings, which match nothing.
-    const tallyId = typeof row.tallyId === "string" ? row.tallyId.trim() : "";
-    if (tallyId) index.set(tallyId, [...(index.get(tallyId) ?? []), row.id]);
-  }
-  return index;
 }
 
 /**
