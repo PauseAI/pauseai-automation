@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   pacedAirtableRequests,
-  readTallyIndex,
   removalOverrideActive,
   syncAirtablePaying,
   type AirtablePayingStore,
@@ -13,14 +12,13 @@ import { fakeClock } from "./helpers";
 const rec = (n: number) => "rec" + String(n).padStart(14, "0");
 const ids = (from: number, to: number) => Array.from({ length: to - from }, (_, i) => rec(from + i));
 
-/** A store over ticked ids, merge links (loser -> links) and Tally IDs (row -> value), served in pages of `pageSize`. */
+/** A store over ticked ids and merge links (loser -> links), served in pages of `pageSize`. */
 function store(
   ticked: string[],
   clock: ReturnType<typeof fakeClock>,
   options: {
     missing?: string[];
     merged?: Record<string, string | string[]>;
-    tally?: Record<string, unknown>;
     pageSize?: number;
   } = {}
 ) {
@@ -33,7 +31,6 @@ function store(
       ...Object.entries(options.merged ?? {}).map(([id, to]): AirtableRow => ({ id, mergedInto: [to].flat() })),
       { id: rec(9001), mergedInto: [] },
     ],
-    tally: Object.entries(options.tally ?? {}).map(([id, tallyId]) => ({ id, tallyId }) as AirtableRow),
   };
   const s = {
     listPage: vi.fn(async (kind: AirtableRowSet, offset: string | undefined) => {
@@ -238,35 +235,5 @@ describe("removalOverrideActive", () => {
     expect(removalOverrideActive("2026-11-13T11:59:59Z", now)).toBe(false);
     expect(removalOverrideActive("not a time", now)).toBe(false);
     expect(removalOverrideActive(undefined, now)).toBe(false);
-  });
-});
-
-describe("readTallyIndex", () => {
-  it("maps each trimmed Tally id to every row holding it, across pages, paced", async () => {
-    const clock = fakeClock();
-    const s = store([], clock, {
-      pageSize: 2,
-      tally: { [rec(1)]: " KYle2vK\n", [rec(2)]: "A7v1k6e", [rec(3)]: "KYle2vK", [rec(4)]: "  " },
-    });
-    const index = await readTallyIndex(s, pacedAirtableRequests(Infinity, clock));
-    expect([...index]).toEqual([
-      ["KYle2vK", [rec(1), rec(3)]],
-      ["A7v1k6e", [rec(2)]],
-    ]);
-    expect(s.listPage.mock.calls.map((call) => call[0])).toEqual(["tally", "tally"]);
-    expect(clock.starts[1] - clock.starts[0]).toBeGreaterThanOrEqual(200);
-  });
-
-  it("skips values that are not text, as a retyped field returns", async () => {
-    const clock = fakeClock();
-    const s = store([], clock, { tally: { [rec(1)]: ["KYle2vK"], [rec(2)]: 7 } });
-    expect((await readTallyIndex(s, pacedAirtableRequests(Infinity, clock))).size).toBe(0);
-  });
-
-  it("matches case-sensitively", async () => {
-    const clock = fakeClock();
-    const s = store([], clock, { tally: { [rec(1)]: "kyle2vk" } });
-    const index = await readTallyIndex(s, pacedAirtableRequests(Infinity, clock));
-    expect(index.get("KYle2vK")).toBeUndefined();
   });
 });
