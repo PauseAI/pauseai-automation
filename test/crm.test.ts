@@ -6,10 +6,15 @@ const CONFIG = { url: "https://crm.test", key: "secret-key" };
 const FAR = Date.now() + 3_600_000;
 
 function answers(...rows: unknown[]) {
-  const fetchMock = vi.fn(async () => new Response(JSON.stringify({ values: [rows.shift()] }), { status: 200 }));
+  const fetchMock = vi.fn(
+    async (_url: string, _init: RequestInit) => new Response(JSON.stringify({ values: [rows.shift()] }), { status: 200 })
+  );
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
 }
+
+/** The init of the first fetch. */
+const sentInit = (fetchMock: ReturnType<typeof answers>) => fetchMock.mock.calls[0][1];
 
 
 afterEach(() => {
@@ -26,13 +31,23 @@ describe("crmConfigFromEnv", () => {
     expect(crmConfigFromEnv({ CRM_URL: "https://crm.test" })).toBeNull();
     expect(crmConfigFromEnv({ CRM_STRIPE_WEBHOOK_KEY: "k" })).toBeNull();
   });
+
+  it("takes the Cloudflare Access token only when both of its settings are set", () => {
+    const base = { CRM_URL: "https://crm.pauseai.info", CRM_STRIPE_WEBHOOK_KEY: "k" };
+    expect(crmConfigFromEnv({ ...base, CF_ACCESS_CLIENT_ID: "id", CF_ACCESS_CLIENT_SECRET: "s" })?.cfAccess).toEqual({
+      clientId: "id",
+      clientSecret: "s",
+    });
+    expect(crmConfigFromEnv({ ...base, CF_ACCESS_CLIENT_ID: "id" })?.cfAccess).toBeUndefined();
+    expect(crmConfigFromEnv({ ...base, CF_ACCESS_CLIENT_SECRET: "s" })?.cfAccess).toBeUndefined();
+  });
 });
 
 describe("callCrm", () => {
   it("posts the API4 call with the key in X-Civi-Auth", async () => {
     const fetchMock = answers({ status: "ok" });
     await callCrm(CONFIG, "PauseaiPayingMember/reconcile", { member_ids: [REC], dry_run: true }, 1_000);
-    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("https://crm.test/civicrm/ajax/api4/PauseaiPayingMember/reconcile");
     expect(init.method).toBe("POST");
     expect((init.headers as Record<string, string>)["X-Civi-Auth"]).toBe("Bearer secret-key");
@@ -43,6 +58,52 @@ describe("callCrm", () => {
   it.each([500, 503, 401])("rejects on HTTP %i", async (status) => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status })));
     await expect(callCrm(CONFIG, "X/y", {}, 1_000)).rejects.toThrow(`HTTP ${status}`);
+  });
+
+  describe("Cloudflare Access service token", () => {
+    const CF = { clientId: "test-id.access", clientSecret: "test-secret-not-real" };
+    const PROD = { url: "https://crm.pauseai.info", key: "secret-key", cfAccess: CF };
+    const sentHeaders = (fetchMock: ReturnType<typeof answers>) => sentInit(fetchMock).headers as Record<string, string>;
+    const cfHeaderNames = (headers: Record<string, string>) => Object.keys(headers).filter((name) => name.startsWith("CF-"));
+
+    it("sends both headers to the production CRM, with redirects off", async () => {
+      const fetchMock = answers({ status: "ok" });
+      await callCrm(PROD, "X/y", {}, 1_000);
+      expect(sentHeaders(fetchMock)).toMatchObject({
+        "X-Civi-Auth": "Bearer secret-key",
+        "CF-Access-Client-Id": CF.clientId,
+        "CF-Access-Client-Secret": CF.clientSecret,
+      });
+      expect(sentInit(fetchMock).redirect).toBe("manual");
+    });
+
+    it("sends neither header when unset", async () => {
+      const fetchMock = answers({ status: "ok" });
+      await callCrm({ url: PROD.url, key: PROD.key }, "X/y", {}, 1_000);
+      expect(cfHeaderNames(sentHeaders(fetchMock))).toEqual([]);
+    });
+
+    it.each(["https://crm.pauseai.info:443", "https://CRM.pauseai.info"])("sends both headers to %s", async (url) => {
+      const fetchMock = answers({ status: "ok" });
+      await callCrm({ ...PROD, url }, "X/y", {}, 1_000);
+      expect(cfHeaderNames(sentHeaders(fetchMock))).toEqual(["CF-Access-Client-Id", "CF-Access-Client-Secret"]);
+    });
+
+    it.each(["https://crm.test", "http://crm.pauseai.info", "https://crm.pauseai.info:8443", "https://crm.pauseai.info.example.org"])(
+      "sends neither header to %s",
+      async (url) => {
+        const fetchMock = answers({ status: "ok" });
+        await callCrm({ ...PROD, url }, "X/y", {}, 1_000);
+        expect(cfHeaderNames(sentHeaders(fetchMock))).toEqual([]);
+      }
+    );
+
+    it.each([301, 302, 307, 308])("rejects on a %i redirect, naming no credential", async (status) => {
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status, headers: { Location: "https://elsewhere.test/" } })));
+      const error = await callCrm(PROD, "X/y", {}, 1_000).catch((e: Error) => e);
+      expect(String(error)).toMatch(new RegExp(`redirect \\(HTTP ${status}\\)`));
+      for (const secret of [PROD.key, CF.clientId, CF.clientSecret]) expect(String(error)).not.toContain(secret);
+    });
   });
 
   it("rejects on an answer without a status", async () => {
@@ -108,7 +169,7 @@ describe("reconcilePayingInCrm", () => {
     const fetchMock = answers(PROBE_WRITE);
     const result = await reconcilePayingInCrm(CONFIG, [REC, MEM], { dryRun: false, deadline: FAR, unmappedPaying: 3 });
     expect(fetchMock).toHaveBeenCalledOnce();
-    const init = (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1];
+    const init = sentInit(fetchMock);
     expect(JSON.parse((init.body as URLSearchParams).get("params")!)).toEqual({
       member_ids: [REC, MEM],
       dry_run: false,
@@ -135,7 +196,7 @@ describe("reconcilePayingInCrm", () => {
   it("keeps a dry run's whole answer for the log", async () => {
     const fetchMock = answers(PROBE_DRY_RUN);
     const result = await reconcilePayingInCrm(CONFIG, [REC], { dryRun: true, deadline: FAR, unmappedPaying: 0 });
-    const init = (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1];
+    const init = sentInit(fetchMock);
     expect(JSON.parse((init.body as URLSearchParams).get("params")!)).toMatchObject({ dry_run: true });
     expect(result.answer).toEqual(PROBE_DRY_RUN);
   });
@@ -151,7 +212,7 @@ describe("reconcilePayingInCrm", () => {
       throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
     });
     vi.stubGlobal("fetch", fetchMock);
-    await expect(reconcilePayingInCrm(CONFIG, [REC], { dryRun: false, deadline: FAR, unmappedPaying: 0 })).rejects.toThrow(/timeout/);
+    await expect(reconcilePayingInCrm(CONFIG, [REC], { dryRun: false, deadline: FAR, unmappedPaying: 0 })).rejects.toThrow(/request failed: TimeoutError/);
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 });

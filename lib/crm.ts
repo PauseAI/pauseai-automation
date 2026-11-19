@@ -5,37 +5,72 @@ const API_PATH = "/civicrm/ajax/api4/";
 // cuts a request at 100 s; the CRM finishes a write even after the caller
 // gives up, and the next day's run picks up anything left.
 const RECONCILE_TIMEOUT_MS = 60_000;
+// Only the production CRM sits behind Cloudflare Access; the service token goes nowhere else.
+const CF_ACCESS_ORIGIN = "https://crm.pauseai.info";
+// fetch refuses these in a header value with an error that quotes the value.
+const CONTROL_CHARACTER = /[\x00-\x1f\x7f]/;
 
 export interface CrmConfig {
   url: string;
   key: string;
+  /** The Cloudflare Access service token, when both of its settings are set. */
+  cfAccess?: { clientId: string; clientSecret: string };
 }
 
-/** The CRM settings, or null when either is unset. */
+/** The CRM settings, or null when the URL or key is unset. */
 export function crmConfigFromEnv(env: NodeJS.ProcessEnv = process.env): CrmConfig | null {
   const url = env.CRM_URL?.replace(/\/+$/, "");
   const key = env.CRM_STRIPE_WEBHOOK_KEY;
-  return url && key ? { url, key } : null;
+  if (!url || !key) return null;
+  const clientId = env.CF_ACCESS_CLIENT_ID;
+  const clientSecret = env.CF_ACCESS_CLIENT_SECRET;
+  return clientId && clientSecret ? { url, key, cfAccess: { clientId, clientSecret } } : { url, key };
 }
 
-/** Calls one API4 action and answers its result row. Rejects on a network error, timeout, HTTP error or a row without a status. */
+/** The service-token headers for a request to `url`: only to the production CRM, and only when configured. */
+function cfAccessHeaders(config: CrmConfig, url: string): Record<string, string> {
+  if (!config.cfAccess || new URL(url).origin !== CF_ACCESS_ORIGIN) return {};
+  return {
+    "CF-Access-Client-Id": config.cfAccess.clientId,
+    "CF-Access-Client-Secret": config.cfAccess.clientSecret,
+  };
+}
+
+/** Calls one API4 action and answers its result row. Rejects on a network error, timeout, redirect, HTTP error or a row without a status. */
 export async function callCrm(
   config: CrmConfig,
   action: string,
   params: unknown,
   timeoutMs: number
 ): Promise<Record<string, unknown>> {
-  const response = await fetch(config.url + API_PATH + action, {
-    method: "POST",
-    headers: {
-      // CiviCRM accepts an API key only in X-Civi-Auth.
-      "X-Civi-Auth": `Bearer ${config.key}`,
-      "X-Requested-With": "XMLHttpRequest",
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: new URLSearchParams({ params: JSON.stringify(params) }),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
+  const url = config.url + API_PATH + action;
+  const headers: Record<string, string> = {
+    // CiviCRM accepts an API key only in X-Civi-Auth.
+    "X-Civi-Auth": `Bearer ${config.key}`,
+    "X-Requested-With": "XMLHttpRequest",
+    "Content-Type": "application/x-www-form-urlencoded",
+    ...cfAccessHeaders(config, url),
+  };
+  if (Object.values(headers).some((value) => CONTROL_CHARACTER.test(value))) {
+    throw new Error(`CiviCRM ${action}: CRM_STRIPE_WEBHOOK_KEY or the Cloudflare Access token has a control character in it`);
+  }
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ params: JSON.stringify(params) }),
+      // fetch would carry the key and the service token on to wherever a redirect points.
+      redirect: "manual",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (error) {
+    // A new error with the name and cause code only, no message and no cause: fetch's own message can quote a header.
+    throw new Error(`CiviCRM ${action} request failed: ${describeFetchError(error)}`);
+  }
+  if (response.status >= 300 && response.status < 400) {
+    throw new Error(`CiviCRM ${action} answered a redirect (HTTP ${response.status}), which is not followed: check CRM_URL`);
+  }
   if (!response.ok) throw new Error(`CiviCRM ${action} answered HTTP ${response.status}`);
   const body = (await response.json()) as { values?: unknown[] } | null;
   const row = body?.values?.[0];
@@ -43,6 +78,12 @@ export async function callCrm(
     throw new Error(`CiviCRM ${action} answered without a status`);
   }
   return row as Record<string, unknown>;
+}
+
+function describeFetchError(error: unknown): string {
+  const name = error instanceof Error ? error.name : typeof error;
+  const code = (error as { cause?: { code?: unknown } } | null)?.cause?.code;
+  return typeof code === "string" && /^[A-Z0-9_]+$/.test(code) ? `${name} (${code})` : name;
 }
 
 /** Why sent ids named no member: lists of ids (capped by the CRM) or counts. */

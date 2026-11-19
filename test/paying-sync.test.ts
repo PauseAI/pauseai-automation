@@ -1,5 +1,6 @@
+import { inspect } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ReconcileResult } from "../lib/crm";
+import { reconcilePayingInCrm, type ReconcileResult } from "../lib/crm";
 import { memberIdsBySubscription, paginate, syncPaying, type Page, type SyncDeps } from "../lib/paying-sync";
 import type { AirtableRowSet } from "../lib/airtable-paying";
 import { MEM, MEM2, PRODUCT, REC, REC2, TALLY, TALLY2, fakeClock, session, subscription } from "./helpers";
@@ -280,5 +281,42 @@ describe("syncPaying", () => {
     expect(reconcile.mock.calls[0][0]).toEqual([]);
     const warnings = logged("warn").filter((line) => line.includes("sub_1") || line.includes("xxx"));
     expect(warnings).toEqual([`Paying sync: subscription sub_1: member_id metadata of no known shape: "${"x".repeat(63)}`]);
+  });
+});
+
+describe("a malformed CRM credential", () => {
+  const SECRET = "leaked-value";
+  const config = (override: Partial<Record<"key" | "clientId" | "clientSecret", string>>) => {
+    const v = { key: "test-key", clientId: "test-id.access", clientSecret: "test-secret", ...override };
+    return { url: "https://crm.pauseai.info", key: v.key, cfAccess: { clientId: v.clientId, clientSecret: v.clientSecret } };
+  };
+  // Everything console.error would print, the stack and any cause included.
+  const printed = () => vi.mocked(console.error).mock.calls.map((call) => inspect(call, { depth: 10 })).join("\n");
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it.each(["key", "clientId", "clientSecret"] as const)("in the %s fails the reconcile without logging the value", async (bad) => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const { d, alert } = deps({ reconcile: (ids, options) => reconcilePayingInCrm(config({ [bad]: `${SECRET}\nX-Injected: 1` }), ids, { ...options, unmappedPaying: 0 }) });
+    await syncPaying(d);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(printed()).toContain("control character");
+    expect(printed()).not.toContain(SECRET);
+    expect(alert).toHaveBeenCalled();
+  });
+
+  it("keeps a fetch error that quotes a header out of the log", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit) => {
+        const secret = (init.headers as Record<string, string>)["CF-Access-Client-Secret"];
+        throw new TypeError(`Headers.append: "${secret}" is an invalid header value`, { cause: new Error(secret) });
+      })
+    );
+    const { d } = deps({ reconcile: (ids, options) => reconcilePayingInCrm(config({ clientSecret: SECRET }), ids, { ...options, unmappedPaying: 0 }) });
+    await syncPaying(d);
+    expect(printed()).toContain("request failed: TypeError");
+    expect(printed()).not.toContain(SECRET);
   });
 });
