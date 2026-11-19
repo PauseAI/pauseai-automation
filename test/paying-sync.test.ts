@@ -286,9 +286,9 @@ describe("syncPaying", () => {
 
 describe("a malformed CRM credential", () => {
   const SECRET = "leaked-value";
-  const config = (bad: "key" | "clientId" | "clientSecret") => {
-    const values = { key: "test-key", clientId: "test-id.access", clientSecret: "test-secret", [bad]: `${SECRET}\nX-Injected: 1` };
-    return { url: "https://crm.pauseai.info", key: values.key, cfAccess: { clientId: values.clientId, clientSecret: values.clientSecret } };
+  const config = (override: Partial<Record<"key" | "clientId" | "clientSecret", string>>) => {
+    const v = { key: "test-key", clientId: "test-id.access", clientSecret: "test-secret", ...override };
+    return { url: "https://crm.pauseai.info", key: v.key, cfAccess: { clientId: v.clientId, clientSecret: v.clientSecret } };
   };
   // Everything console.error would print, the stack and any cause included.
   const printed = () => vi.mocked(console.error).mock.calls.map((call) => inspect(call, { depth: 10 })).join("\n");
@@ -298,7 +298,7 @@ describe("a malformed CRM credential", () => {
   it.each(["key", "clientId", "clientSecret"] as const)("in the %s fails the reconcile without logging the value", async (bad) => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
-    const { d, alert } = deps({ reconcile: (ids, options) => reconcilePayingInCrm(config(bad), ids, { ...options, unmappedPaying: 0 }) });
+    const { d, alert } = deps({ reconcile: (ids, options) => reconcilePayingInCrm(config({ [bad]: `${SECRET}\nX-Injected: 1` }), ids, { ...options, unmappedPaying: 0 }) });
     await syncPaying(d);
     expect(fetchMock).not.toHaveBeenCalled();
     expect(printed()).toContain("control character");
@@ -314,8 +314,7 @@ describe("a malformed CRM credential", () => {
         throw new TypeError(`Headers.append: "${secret}" is an invalid header value`, { cause: new Error(secret) });
       })
     );
-    const ok = { url: "https://crm.pauseai.info", key: "test-key", cfAccess: { clientId: "test-id.access", clientSecret: SECRET } };
-    const { d } = deps({ reconcile: (ids, options) => reconcilePayingInCrm(ok, ids, { ...options, unmappedPaying: 0 }) });
+    const { d } = deps({ reconcile: (ids, options) => reconcilePayingInCrm(config({ clientSecret: SECRET }), ids, { ...options, unmappedPaying: 0 }) });
     await syncPaying(d);
     expect(printed()).toContain("request failed: TypeError");
     expect(printed()).not.toContain(SECRET);

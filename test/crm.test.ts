@@ -6,10 +6,15 @@ const CONFIG = { url: "https://crm.test", key: "secret-key" };
 const FAR = Date.now() + 3_600_000;
 
 function answers(...rows: unknown[]) {
-  const fetchMock = vi.fn(async () => new Response(JSON.stringify({ values: [rows.shift()] }), { status: 200 }));
+  const fetchMock = vi.fn(
+    async (_url: string, _init: RequestInit) => new Response(JSON.stringify({ values: [rows.shift()] }), { status: 200 })
+  );
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
 }
+
+/** The init of the first fetch. */
+const sentInit = (fetchMock: ReturnType<typeof answers>) => fetchMock.mock.calls[0][1];
 
 
 afterEach(() => {
@@ -42,7 +47,7 @@ describe("callCrm", () => {
   it("posts the API4 call with the key in X-Civi-Auth", async () => {
     const fetchMock = answers({ status: "ok" });
     await callCrm(CONFIG, "PauseaiPayingMember/reconcile", { member_ids: [REC], dry_run: true }, 1_000);
-    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("https://crm.test/civicrm/ajax/api4/PauseaiPayingMember/reconcile");
     expect(init.method).toBe("POST");
     expect((init.headers as Record<string, string>)["X-Civi-Auth"]).toBe("Bearer secret-key");
@@ -58,8 +63,7 @@ describe("callCrm", () => {
   describe("Cloudflare Access service token", () => {
     const CF = { clientId: "test-id.access", clientSecret: "test-secret-not-real" };
     const PROD = { url: "https://crm.pauseai.info", key: "secret-key", cfAccess: CF };
-    const sentHeaders = (fetchMock: ReturnType<typeof answers>) =>
-      (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].headers as Record<string, string>;
+    const sentHeaders = (fetchMock: ReturnType<typeof answers>) => sentInit(fetchMock).headers as Record<string, string>;
     const cfHeaderNames = (headers: Record<string, string>) => Object.keys(headers).filter((name) => name.startsWith("CF-"));
 
     it("sends both headers to the production CRM, with redirects off", async () => {
@@ -70,7 +74,7 @@ describe("callCrm", () => {
         "CF-Access-Client-Id": CF.clientId,
         "CF-Access-Client-Secret": CF.clientSecret,
       });
-      expect((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].redirect).toBe("manual");
+      expect(sentInit(fetchMock).redirect).toBe("manual");
     });
 
     it("sends neither header when unset", async () => {
@@ -165,7 +169,7 @@ describe("reconcilePayingInCrm", () => {
     const fetchMock = answers(PROBE_WRITE);
     const result = await reconcilePayingInCrm(CONFIG, [REC, MEM], { dryRun: false, deadline: FAR, unmappedPaying: 3 });
     expect(fetchMock).toHaveBeenCalledOnce();
-    const init = (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1];
+    const init = sentInit(fetchMock);
     expect(JSON.parse((init.body as URLSearchParams).get("params")!)).toEqual({
       member_ids: [REC, MEM],
       dry_run: false,
@@ -192,7 +196,7 @@ describe("reconcilePayingInCrm", () => {
   it("keeps a dry run's whole answer for the log", async () => {
     const fetchMock = answers(PROBE_DRY_RUN);
     const result = await reconcilePayingInCrm(CONFIG, [REC], { dryRun: true, deadline: FAR, unmappedPaying: 0 });
-    const init = (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1];
+    const init = sentInit(fetchMock);
     expect(JSON.parse((init.body as URLSearchParams).get("params")!)).toMatchObject({ dry_run: true });
     expect(result.answer).toEqual(PROBE_DRY_RUN);
   });
