@@ -7,6 +7,8 @@ const API_PATH = "/civicrm/ajax/api4/";
 const RECONCILE_TIMEOUT_MS = 60_000;
 // Only the production CRM sits behind Cloudflare Access; the service token goes nowhere else.
 const CF_ACCESS_ORIGIN = "https://crm.pauseai.info";
+// fetch refuses these in a header value with an error that quotes the value.
+const CONTROL_CHARACTER = /[\x00-\x1f\x7f]/;
 
 export interface CrmConfig {
   url: string;
@@ -42,20 +44,30 @@ export async function callCrm(
   timeoutMs: number
 ): Promise<Record<string, unknown>> {
   const url = config.url + API_PATH + action;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      // CiviCRM accepts an API key only in X-Civi-Auth.
-      "X-Civi-Auth": `Bearer ${config.key}`,
-      "X-Requested-With": "XMLHttpRequest",
-      "Content-Type": "application/x-www-form-urlencoded",
-      ...cfAccessHeaders(config, url),
-    },
-    body: new URLSearchParams({ params: JSON.stringify(params) }),
-    // fetch would carry the key and the service token on to wherever a redirect points.
-    redirect: "manual",
-    signal: AbortSignal.timeout(timeoutMs),
-  });
+  const headers: Record<string, string> = {
+    // CiviCRM accepts an API key only in X-Civi-Auth.
+    "X-Civi-Auth": `Bearer ${config.key}`,
+    "X-Requested-With": "XMLHttpRequest",
+    "Content-Type": "application/x-www-form-urlencoded",
+    ...cfAccessHeaders(config, url),
+  };
+  if (Object.values(headers).some((value) => CONTROL_CHARACTER.test(value))) {
+    throw new Error(`CiviCRM ${action}: CRM_STRIPE_WEBHOOK_KEY or the Cloudflare Access token has a control character in it`);
+  }
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers,
+      body: new URLSearchParams({ params: JSON.stringify(params) }),
+      // fetch would carry the key and the service token on to wherever a redirect points.
+      redirect: "manual",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (error) {
+    // A new error with the name and cause code only, no message and no cause: fetch's own message can quote a header.
+    throw new Error(`CiviCRM ${action} request failed: ${describeFetchError(error)}`);
+  }
   if (response.status >= 300 && response.status < 400) {
     throw new Error(`CiviCRM ${action} answered a redirect (HTTP ${response.status}), which is not followed: check CRM_URL`);
   }
@@ -66,6 +78,12 @@ export async function callCrm(
     throw new Error(`CiviCRM ${action} answered without a status`);
   }
   return row as Record<string, unknown>;
+}
+
+function describeFetchError(error: unknown): string {
+  const name = error instanceof Error ? error.name : typeof error;
+  const code = (error as { cause?: { code?: unknown } } | null)?.cause?.code;
+  return typeof code === "string" && /^[A-Z0-9_]+$/.test(code) ? `${name} (${code})` : name;
 }
 
 /** Why sent ids named no member: lists of ids (capped by the CRM) or counts. */

@@ -79,6 +79,12 @@ describe("callCrm", () => {
       expect(cfHeaderNames(sentHeaders(fetchMock))).toEqual([]);
     });
 
+    it.each(["https://crm.pauseai.info:443", "https://CRM.pauseai.info"])("sends both headers to %s", async (url) => {
+      const fetchMock = answers({ status: "ok" });
+      await callCrm({ ...PROD, url }, "X/y", {}, 1_000);
+      expect(cfHeaderNames(sentHeaders(fetchMock))).toEqual(["CF-Access-Client-Id", "CF-Access-Client-Secret"]);
+    });
+
     it.each(["https://crm.test", "http://crm.pauseai.info", "https://crm.pauseai.info:8443", "https://crm.pauseai.info.example.org"])(
       "sends neither header to %s",
       async (url) => {
@@ -202,7 +208,7 @@ describe("reconcilePayingInCrm", () => {
       throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
     });
     vi.stubGlobal("fetch", fetchMock);
-    await expect(reconcilePayingInCrm(CONFIG, [REC], { dryRun: false, deadline: FAR, unmappedPaying: 0 })).rejects.toThrow(/timeout/);
+    await expect(reconcilePayingInCrm(CONFIG, [REC], { dryRun: false, deadline: FAR, unmappedPaying: 0 })).rejects.toThrow(/request failed: TimeoutError/);
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 });
