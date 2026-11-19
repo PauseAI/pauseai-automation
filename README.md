@@ -29,6 +29,8 @@ The first real run may write many contacts and outlast the 60-second CiviCRM tim
 
 While `CRM_URL` or `CRM_STRIPE_WEBHOOK_KEY` is unset, the sync writes Airtable only and skips signup ids, with one log line.
 
+`CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` hold the `stripe-webhook` account's Cloudflare Access service token, which the CRM API needs once it sits behind Cloudflare Access. With both set, the CRM call sends them as `CF-Access-Client-Id` and `CF-Access-Client-Secret`, only when `CRM_URL` is `https://crm.pauseai.info`; with either unset it sends neither. The secret is set where `CRM_STRIPE_WEBHOOK_KEY` is and never logged. The CRM call never follows a redirect: a 3xx fails the reconcile.
+
 The Stripe webhook route `server/routes/stripe.post.ts` only acknowledges events, until the endpoint is removed from Stripe. A real-time path would also need the CRM's `stripe-webhook` API key allowed to call `PauseaiPayingMember.set` again.
 
 Accepted limits:

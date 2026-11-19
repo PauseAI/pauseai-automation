@@ -26,6 +26,16 @@ describe("crmConfigFromEnv", () => {
     expect(crmConfigFromEnv({ CRM_URL: "https://crm.test" })).toBeNull();
     expect(crmConfigFromEnv({ CRM_STRIPE_WEBHOOK_KEY: "k" })).toBeNull();
   });
+
+  it("takes the Cloudflare Access token only when both of its settings are set", () => {
+    const base = { CRM_URL: "https://crm.pauseai.info", CRM_STRIPE_WEBHOOK_KEY: "k" };
+    expect(crmConfigFromEnv({ ...base, CF_ACCESS_CLIENT_ID: "id", CF_ACCESS_CLIENT_SECRET: "s" })?.cfAccess).toEqual({
+      clientId: "id",
+      clientSecret: "s",
+    });
+    expect(crmConfigFromEnv({ ...base, CF_ACCESS_CLIENT_ID: "id" })?.cfAccess).toBeUndefined();
+    expect(crmConfigFromEnv({ ...base, CF_ACCESS_CLIENT_SECRET: "s" })?.cfAccess).toBeUndefined();
+  });
 });
 
 describe("callCrm", () => {
@@ -43,6 +53,47 @@ describe("callCrm", () => {
   it.each([500, 503, 401])("rejects on HTTP %i", async (status) => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status })));
     await expect(callCrm(CONFIG, "X/y", {}, 1_000)).rejects.toThrow(`HTTP ${status}`);
+  });
+
+  describe("Cloudflare Access service token", () => {
+    const CF = { clientId: "test-id.access", clientSecret: "test-secret-not-real" };
+    const PROD = { url: "https://crm.pauseai.info", key: "secret-key", cfAccess: CF };
+    const sentHeaders = (fetchMock: ReturnType<typeof answers>) =>
+      (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].headers as Record<string, string>;
+    const cfHeaderNames = (headers: Record<string, string>) => Object.keys(headers).filter((name) => name.startsWith("CF-"));
+
+    it("sends both headers to the production CRM, with redirects off", async () => {
+      const fetchMock = answers({ status: "ok" });
+      await callCrm(PROD, "X/y", {}, 1_000);
+      expect(sentHeaders(fetchMock)).toMatchObject({
+        "X-Civi-Auth": "Bearer secret-key",
+        "CF-Access-Client-Id": CF.clientId,
+        "CF-Access-Client-Secret": CF.clientSecret,
+      });
+      expect((fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].redirect).toBe("manual");
+    });
+
+    it("sends neither header when unset", async () => {
+      const fetchMock = answers({ status: "ok" });
+      await callCrm({ url: PROD.url, key: PROD.key }, "X/y", {}, 1_000);
+      expect(cfHeaderNames(sentHeaders(fetchMock))).toEqual([]);
+    });
+
+    it.each(["https://crm.test", "http://crm.pauseai.info", "https://crm.pauseai.info:8443", "https://crm.pauseai.info.example.org"])(
+      "sends neither header to %s",
+      async (url) => {
+        const fetchMock = answers({ status: "ok" });
+        await callCrm({ ...PROD, url }, "X/y", {}, 1_000);
+        expect(cfHeaderNames(sentHeaders(fetchMock))).toEqual([]);
+      }
+    );
+
+    it.each([301, 302, 307, 308])("rejects on a %i redirect, naming no credential", async (status) => {
+      vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status, headers: { Location: "https://elsewhere.test/" } })));
+      const error = await callCrm(PROD, "X/y", {}, 1_000).catch((e: Error) => e);
+      expect(String(error)).toMatch(new RegExp(`redirect \\(HTTP ${status}\\)`));
+      for (const secret of [PROD.key, CF.clientId, CF.clientSecret]) expect(String(error)).not.toContain(secret);
+    });
   });
 
   it("rejects on an answer without a status", async () => {
